@@ -5,42 +5,6 @@ import theano
 import theano.tensor as T
 import os
 numpy.set_printoptions(formatter={'float': '{: 0.3f}'.format})
-''' Orthogonalize
-by QR decomposition (column-wise) '''
-from theano.tensor import as_tensor_variable
-from theano.gof import Op, Apply
-class Orthogonalize(Op): # define theano Op
-    _numpyqr = staticmethod(numpy.linalg.qr) # static numpy qr
-    __props__ = () # no properties for this Op
-    # creates an Apply node
-    def make_node(self, x):
-        x = as_tensor_variable(x)
-        assert x.ndim == 2, "The input of qr function should be a matrix."
-        y = theano.tensor.matrix(dtype=x.dtype)
-        return Apply(self, [x], [y])
-    # Phython implementation
-    def perform(self, node, inputs, outputs):
-        (x,) = inputs
-        (y,) = outputs
-        assert x.ndim == 2, "The input of qr function should be a matrix."
-        q, r = self._numpyqr(x,'reduced') # QR decomposition
-        # d = diagonal of r as vector
-        if r.shape[0] < r.shape[1]:
-            d = r[:, 0]
-        else:
-            d = r[0]
-        d.strides = (r.strides[0] + r.strides[1],)
-        # column-wise multiply d to q
-        q *= d
-        # if q columns < x columns, pad zero columns from the right
-        if q.shape[1] < x.shape[1]:
-            q = numpy.pad(q, ((0,0),(0,x.shape[1]-q.shape[1])),'constant')
-        y[0] = q # set output to q
-    # string representation
-    def __str__(self):
-        return 'Orthogonalize'
-# alias
-orth = Orthogonalize()
 ''' RBM (method CD)
 * unbiased, spins take values in {-1,+1}.
 Nv::int: number of visible units
@@ -74,15 +38,13 @@ class RBM(object):
         # symbolize rates
         self.lr = T.scalar('lr',dtype=theano.config.floatX)
         self.fr = T.scalar('fr',dtype=theano.config.floatX)
-        self.orth_on = T.scalar('orth_on',dtype='int8')
         # build learning function for default RBM 
         if self.type is 'default':
             cost, updates = self.get_cost_updates()
             self.learn = theano.function(
                 [self.input, 
                  theano.In(self.lr, value=0.1),
-                 theano.In(self.fr, value=0.),
-                 theano.In(self.orth_on, value=False)],
+                 theano.In(self.fr, value=0.)],
                 cost, updates = updates, name = 'RBM.learn')
     # initialize random number generator
     def init_rng(self, numpy_rng, theano_rng):
@@ -193,9 +155,6 @@ class RBM(object):
         hf_means = h_means_chain[-1]
         # compute negative gradient on weights
         dW = (T.dot(self.input.T,h0_means) - T.dot(vf_samples.T,hf_means))/self.batch_size
-        # if epoch == 0, turn on orthogonalization mode
-        # orthogonalize dW to prevent learning the same feature
-        dW = theano.ifelse.ifelse(self.orth_on,orth(dW),dW) 
         # add W update rules to updates dict
         updates[self.W] = T.nnet.relu((1-self.fr)*self.W + self.lr*dW)
         # cost function: recontruction cross entropy (per visible)
@@ -256,8 +215,7 @@ class DBM(object):
             rbm.learn = theano.function(
                 [self.input,
                  theano.In(rbm.lr, value=0.1),
-                 theano.In(rbm.fr, value=0.),
-                 theano.In(rbm.orth_on, value=False)],
+                 theano.In(rbm.fr, value=0.)],
                 cost, updates = updates, name = 'RBM.learn')
             self.rbms.append(rbm)
     # pretrain RBMs
@@ -282,7 +240,7 @@ class DBM(object):
                 # go through training set served by data_source
                 costs = []
                 for batch in data_source:
-                    cost = rbm.learn(batch, lr, fr, epoch == 0)
+                    cost = rbm.learn(batch, lr, fr)
                     costs.append(numpy.asscalar(cost))
                 # calculate cost average and standard deviation
                 cost_avg = numpy.mean(costs)

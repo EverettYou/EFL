@@ -107,3 +107,44 @@ class DBN(object):
                 print('Epoch %d: '%epoch, 'cost = %f, xent = %f'%(cost, xent))
             # generate train_set for the next layer
             train_set = rbm.bottomup(train_set)
+
+
+
+
+
+''' Orthogonalize
+by QR decomposition (column-wise) '''
+from theano.tensor import as_tensor_variable
+from theano.gof import Op, Apply
+class Orthogonalize(Op): # define theano Op
+    _numpyqr = staticmethod(numpy.linalg.qr) # static numpy qr
+    __props__ = () # no properties for this Op
+    # creates an Apply node
+    def make_node(self, x):
+        x = as_tensor_variable(x)
+        assert x.ndim == 2, "The input of qr function should be a matrix."
+        y = theano.tensor.matrix(dtype=x.dtype)
+        return Apply(self, [x], [y])
+    # Phython implementation
+    def perform(self, node, inputs, outputs):
+        (x,) = inputs
+        (y,) = outputs
+        assert x.ndim == 2, "The input of qr function should be a matrix."
+        q, r = self._numpyqr(x,'reduced') # QR decomposition
+        # d = diagonal of r as vector
+        if r.shape[0] < r.shape[1]:
+            d = r[:, 0]
+        else:
+            d = r[0]
+        d.strides = (r.strides[0] + r.strides[1],)
+        # column-wise multiply d to q
+        q *= d
+        # if q columns < x columns, pad zero columns from the right
+        if q.shape[1] < x.shape[1]:
+            q = numpy.pad(q, ((0,0),(0,x.shape[1]-q.shape[1])),'constant')
+        y[0] = q # set output to q
+    # string representation
+    def __str__(self):
+        return 'Orthogonalize'
+# alias
+orth = Orthogonalize()

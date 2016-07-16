@@ -15,6 +15,7 @@ type::string: type of RBM in a DBM, can be 'default', 'bottom', 'top', 'intermed
 Markov_steps::int: number of Markov steps in Gibbs sampling
 '''
 class RBM(object):
+    Markov_steps = 15 # set Markov steps
     ''' RMB Constructor '''
     def __init__(self,
             Nv = 1, Nh = 1, W = None, input = None, type = 'default',
@@ -25,9 +26,8 @@ class RBM(object):
         # set random number generators
         self.init_rng(numpy_rng, theano_rng)
         # symbolize weight matrix
-        self.init_W(W)
+        self.W = self.init_W(W)
         self.type = type # set RBM type
-        self.Markov_steps = 15 # set Markov steps
         # symbolize visible input for RBM
         if input is None:
             self.input = T.matrix('RBM.input',dtype=theano.config.floatX)
@@ -85,13 +85,13 @@ class RBM(object):
             W_mat = numpy.asarray(W_raw, dtype=theano.config.floatX)
             return theano.shared(value=W_mat, name='W', borrow=True) 
         if W is None:
-            self.W = build_W('localrand')
+            return build_W('localrand')
         elif isinstance(W, str):
-            self.W = build_W(W)
+            return build_W(W)
         else: # assuming W is a theano shared matrix
-            self.W = W
             # in this case, Nv, Nh are override by the shape of W
             self.Nv, self.Nh = W.get_value().shape
+            return W
     ''' RBM Physical Dynamics '''
     # Propagate visible configs upwards to hidden configs
     def propup(self, v_samples):
@@ -164,8 +164,13 @@ class RBM(object):
         return cost, updates
 ''' DBM
 Nls::list of int: number of units in each layer
+-------
+L: number of RMB layers = len(Nls)-1
+layer index l: visible l = 0; hidden l = 1, ..., L
 '''
 class DBM(object):
+    Markov_steps = 15 # set Markov steps
+    MC_samples = 20 # number of MC samples
     ''' DMB Constructor '''
     def __init__(self, Nls, numpy_rng = None, theano_rng = None):
         # set structral constants
@@ -174,10 +179,18 @@ class DBM(object):
         assert self.L >= 2  # at least two layers of RBMs 
         # set random number generators
         self.init_rng(numpy_rng, theano_rng)
+        # initialize MC configurations
+        self.MC_configs = self.init_MC_configs()
         # symbolize visible input for DBM
         self.input = T.matrix('DBM.input',dtype=theano.config.floatX)
+        self.lr = T.scalar('lr',dtype=theano.config.floatX)
         # build RBMs
         self.build_rbms()
+        # collect weight matrixes
+        self.Ws = [rbm.W for rbm in self.rbms]
+        # build DBM finetuning
+        cost, updates = self.get_cost_update()
+        self.learn = theano.function([self.input, self.lr], cost, updates=updates)
     # initialize random number generator
     def init_rng(self, numpy_rng, theano_rng):
         # set numpy random number generator
@@ -191,6 +204,16 @@ class DBM(object):
             self.theano_rng = T.shared_randomstreams.RandomStreams(seed)
         else:
             self.theano_rng = theano_rng
+    # initialize MC configs
+    def init_MC_configs(self):
+        MC_configs = []
+        # randomly initialize MC configs
+        for Nl in self.Nls:
+            rand = self.numpy_rng.binomial(n=1,p=0.5,
+                            size=(self.MC_samples,Nl))
+            rand = numpy.asarray(rand*2-1,dtype=theano.config.floatX)
+            MC_configs.append(theano.shared(value=rand, borrow=True))
+        return MC_configs
     # construct RBM layers
     def build_rbms(self):
         self.rbms = [] # initialize RBM container
@@ -242,7 +265,7 @@ class DBM(object):
                 for batch in data_source:
                     cost = rbm.learn(batch, lr, fr)
                     costs.append(numpy.asscalar(cost))
-                # calculate cost average and standard deviation
+                # calculate cost average
                 cost_avg = numpy.mean(costs)
                 print('    Epoch %d: cost = %f'%(epoch,cost_avg/numpy.log(2)))
                 # if effectively no progress
@@ -250,6 +273,106 @@ class DBM(object):
                     break # quit next epoch
                 else: # otherwise save cost_avg and start next epoch
                     cost_avg0 = cost_avg
+    # finetune DBM
+    def finetune(self, data_source, epochs = 5, lrs=[]):
+        assert type(data_source) is Server, 'Input data_source must be a Server.'
+        assert data_source.Nv==self.Nls[0], 'Sample size %d does not fit the visible layer size %d'%(data_source.Nv, self.Nls[0])
+        # go through pretraining epoches
+        lr = 0.5
+        for epoch in range(epochs):
+            # get learning rate and forgetting rate
+            try: # learning rate
+                lr = lrs[epoch]
+            except: # default
+                lr = lr/2
+            # go through training set served by data_source
+            costs = []
+            for batch in data_source:
+                cost = self.learn(batch, lr)
+                costs.append(numpy.asscalar(cost))
+            # calculate cost average 
+            cost_avg = numpy.mean(costs)
+            print('    Epoch %d: cost = %f'%(epoch,cost_avg/numpy.log(2)))
+    ''' DBM Physical Dynamics '''
+    # propagate DBM configs onto a specific layer
+    def proponto(self, l, configs):
+        if l == 0: # bottom (visible) layer inference
+            local_fields = T.dot(configs[1], self.Ws[0].T)
+        elif l == self.L: # top layer inference
+            local_fields = T.dot(configs[self.L-1], self.Ws[self.L-1])
+        else: # intemediate layer inference
+            local_fields = T.dot(configs[l-1], self.Ws[l-1]) + T.dot(configs[l+1], self.Ws[l].T)
+        hl_means = T.tanh(local_fields)
+        return hl_means
+    # infer samples on a specific layer
+    def sample(self, l, configs):
+        # get expectations of layer l
+        hl_means = self.proponto(l, configs)
+        hl_probs = (hl_means+1)/2 # convert to probabilities
+        # get a sample for once (n=1) with probability p
+        hl_samples = self.theano_rng.binomial(
+            size=hl_means.shape, n=1, p=hl_probs,
+            dtype=theano.config.floatX)*2-1
+        return hl_samples
+    # one step gibbs sampling for all layers
+    # soft version: for meanfield updates
+    def soft_gibbs(self, configs):
+        # no even-odd partition needed for meanfield updates
+        return [self.proponto(l, configs) for l in range(0,self.L+1)]
+    # hard version: for Monte Carlo updates
+    def hard_gibbs(self, configs):
+        # allocate empty configs
+        new_configs = [None]*(self.L+1)
+        # first sample odd layers (from old configs as input)
+        for l in range(1,self.L+1,2):
+            new_configs[l] = self.sample(l, configs)
+        # then sample even layers (from new configs of odd layers)
+        for l in range(0,self.L+1,2):
+            new_configs[l] = self.sample(l, new_configs)
+        return new_configs
+    ''' DBM Fine Tuning '''
+    # get meanfield fixed point
+    def get_cost_update(self):
+        # measure correlation from given configs
+        def correlation(configs):
+            return [T.dot(h0.T, h1)/h1.shape[0] 
+                    for h0, h1 in zip(configs[0:],configs[1:])]
+        # initial meanfield configs generated by RGM inference
+        mu_configs = [rbm.output for rbm in self.rbms]
+        # define a meanfield step function to wrap the data
+        def meanfield_step(*mu_configs):
+            # combine with input to make the full config
+            configs = self.soft_gibbs([self.input] + list(mu_configs))
+            return configs[1:]
+        # meanfield iteration
+        results, _ = theano.scan(
+                fn=meanfield_step,
+                outputs_info=mu_configs,
+                n_steps=4)
+        # take the final result and construct meanfield configs
+        mf_configs = [self.input] +[T.sgn(chain[-1]) for chain in results] 
+        # define a MC step function to wrap the data
+        def MC_step(*configs):
+            return self.hard_gibbs(list(configs))
+        # MC iteration
+        results, updates = theano.scan(
+                fn=MC_step,
+                outputs_info=self.MC_configs,
+                n_steps=self.Markov_steps)
+        new_configs = [chain[-1] for chain in results] # take the final result
+        # make update dict for MC configs
+        for old, new in zip(self.MC_configs, new_configs):
+            updates[old] = new
+        # compute negative gradient on weights
+        dWs = [p - n for p, n in zip(correlation(mf_configs), correlation(new_configs))]
+        # add update rules
+        for W, dW in zip(self.Ws, dWs):
+            updates[W] = T.nnet.relu(W + self.lr*dW)
+        # cost function: recontruction cross entropy (per visible)
+        v0_probs = (self.input+1)/2 # initial visible probabilities
+        vf_probs = (self.proponto(0,[[]]+mu_configs)+1)/2   # final visible probabilities
+        cost = T.mean(T.nnet.binary_crossentropy(vf_probs,v0_probs))
+        return cost, updates
 ''' Server (data server)
 dataset::numpy matrix
 '''

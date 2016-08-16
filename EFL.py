@@ -169,8 +169,9 @@ L: number of RMB layers = len(Nls)-1
 layer index l: visible l = 0; hidden l = 1, ..., L
 '''
 class DBM(object):
-    Markov_steps = 15 # set Markov steps
-    MC_samples = 20 # number of MC samples
+    MF_steps = 5 # number of mean field iteration steps
+    MC_steps = 15 # number of Monte Carlo steps
+    MC_samples = 20 # number of Monte Carlo samples
     ''' DMB Constructor '''
     def __init__(self, Nls, numpy_rng = None, theano_rng = None):
         # set structral constants
@@ -180,7 +181,7 @@ class DBM(object):
         # set random number generators
         self.init_rng(numpy_rng, theano_rng)
         # initialize MC configurations
-        self.MC_configs = self.init_MC_configs()
+        self.MC_configs = self.init_MC_configs() # a list of theano.shared
         # symbolize visible input for DBM
         self.input = T.matrix('DBM.input',dtype=theano.config.floatX)
         self.lr = T.scalar('lr',dtype=theano.config.floatX)
@@ -274,13 +275,12 @@ class DBM(object):
                 else: # otherwise save cost_avg and start next epoch
                     cost_avg0 = cost_avg
     # finetune DBM
-    def finetune(self, data_source, epochs = 2, lrs=[]):
+    def finetune(self, data_source, epochs = 4, lrs=[]):
         assert type(data_source) is Server, 'Input data_source must be a Server.'
         assert data_source.Nv==self.Nls[0], 'Sample size %d does not fit the visible layer size %d'%(data_source.Nv, self.Nls[0])
         # go through pretraining epoches
         lr = 0.1
         for epoch in range(epochs):
-            # get learning rate and forgetting rate
             try: # learning rate
                 lr = lrs[epoch]
             except: # default
@@ -314,13 +314,15 @@ class DBM(object):
             size=hl_means.shape, n=1, p=hl_probs,
             dtype=theano.config.floatX)*2-1
         return hl_samples
-    # one step gibbs sampling for all layers
-    # soft version: for meanfield updates
-    def soft_gibbs(self, configs):
+    # one step Gibbs sampling for all layers
+    # soft version: for meanfield updates (clamped)
+    def soft_gibbs(self, *configs):
         # no even-odd partition needed for meanfield updates
-        return [self.proponto(l, configs) for l in range(0,self.L+1)]
-    # hard version: for Monte Carlo updates
-    def hard_gibbs(self, configs):
+        visibles = [configs[0]]
+        hiddens = [self.proponto(l, configs) for l in range(1,self.L+1)]
+        return visibles + hiddens
+    # hard version: for Monte Carlo updates (unclamped)
+    def hard_gibbs(self, *configs):
         # allocate empty configs
         new_configs = [None]*(self.L+1)
         # first sample odd layers (from old configs as input)
@@ -330,42 +332,40 @@ class DBM(object):
         for l in range(0,self.L+1,2):
             new_configs[l] = self.sample(l, new_configs)
         return new_configs
+    # clamped mean field correlation
+    def MF_correlate(self, configs):
+        # mean field iteration
+        results, _ = theano.scan(
+            fn=self.soft_gibbs,
+            outputs_info=configs,
+            n_steps=self.MF_steps)
+        # get fixed point configurations from chain ends
+        configs = [chain[-1] for chain in results]
+        # measure correlation on the fixed point configurations
+        correlations =[T.dot(h0.T, h1)/h1.shape[0] 
+            for h0, h1 in zip(configs[0:],configs[1:])]
+        return configs, correlations
     ''' DBM Fine Tuning '''
     # get meanfield fixed point
     def get_cost_updates(self):
-        # initialize configs by RGM inference
-        configs = [self.input] + [rbm.output for rbm in self.rbms]
-        # define clamped and unclamped step
-        def clamped_step(*configs):
-            configs = self.hard_gibbs([self.input] + list(configs[1:]))
-            return [self.input] + configs[1:]
-        def unclamped_step(*configs):
-            return self.hard_gibbs(list(configs))
-        # meanfield iteration
-        clamped_results, clamped_updates = theano.scan(
-                fn=clamped_step,
-                outputs_info=configs,
-                n_steps=self.Markov_steps)
-        clamped_configs = [chain[-1] for chain in clamped_results]
-        # MC iteration
-        unclamped_results, unclamped_updates = theano.scan(
-                fn=unclamped_step,
-                outputs_info=self.MC_configs,
-                n_steps=self.Markov_steps)
+        # initialize configs by RBM inference
+        clamped_configs = [self.input] + [rbm.output for rbm in self.rbms]
+        # get clamped correlations (mean field)
+        clamped_configs, clamped_correlations = self.MF_correlate(clamped_configs)
+        # relax MC configs by Monte Carlo iterations
+        unclamped_results, updates = theano.scan(
+            fn=self.hard_gibbs,
+            outputs_info=self.MC_configs,
+            n_steps=self.MC_steps)
         unclamped_configs = [chain[-1] for chain in unclamped_results]
-        # combine updates
-        updates = clamped_updates + unclamped_updates
+        # get unclamped correlations (mean field)
+        unclamped_configs, unclamped_correlations = self.MF_correlate(unclamped_configs)
         # make update dict for MC configs
         for old, new in zip(self.MC_configs, unclamped_configs):
             updates[old] = new
-        # measure correlation from given configs
-        def correlation(configs):
-            return [T.dot(h0.T, h1)/h1.shape[0] 
-                    for h0, h1 in zip(configs[0:],configs[1:])]
         # compute negative gradient on weights
         dWs = [clamped - unclamped for clamped, unclamped in 
-               zip(correlation(clamped_configs),
-                   correlation(unclamped_configs))]
+               zip(clamped_correlations, unclamped_correlations)]
         # add update rules
         for W, dW in zip(self.Ws, dWs):
             updates[W] = T.nnet.relu(W + self.lr*dW)

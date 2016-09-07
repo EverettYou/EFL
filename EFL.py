@@ -3,15 +3,16 @@
 import numpy
 import theano
 import theano.tensor as T
-import os
 numpy.set_printoptions(formatter={'float': '{: 0.3f}'.format})
 ''' RBM (method CD)
 * unbiased, spins take values in {-1,+1}.
+---- input:
 Nv::int: number of visible units
 Nh::int: number of hidden units
 W::T.matrix: theano shared weight matrix for a kernel in CDBN.
              None for standalone RBMs.
 type::string: type of RBM in a DBM, can be 'default', 'bottom', 'top', 'intermediate' 
+---- global:
 Markov_steps::int: number of Markov steps in Gibbs sampling
 '''
 class RBM(object):
@@ -163,8 +164,9 @@ class RBM(object):
         cost = T.mean(T.nnet.binary_crossentropy(vf_probs,v0_probs))
         return cost, updates
 ''' DBM
+---- input:
 Nls::list of int: number of units in each layer
--------
+---- local:
 L: number of RMB layers = len(Nls)-1
 layer index l: visible l = 0; hidden l = 1, ..., L
 '''
@@ -375,6 +377,7 @@ class DBM(object):
         cost = T.mean(T.nnet.binary_crossentropy(vf_probs,v0_probs))
         return cost, updates
 ''' Server (data server)
+---- input:
 dataset::numpy matrix
 '''
 class Server(object):
@@ -423,4 +426,195 @@ class Server(object):
         # update dataset
         self.dataset = numpy.append(self.dataset, dataset, axis = 0)
         self.data_size, self.Nv = self.dataset.shape
-
+''' Physical Models '''
+from scipy.sparse import dok_matrix
+from scipy.sparse.linalg import eigsh
+# random Heisenberg chain, return vector representation of the wave function
+def random_Heisenberg(L = 6, J1 = 1., J2 = 1., W = 5., E = 0.):
+    # return a list of k-subsets of range(n), each subset as a list
+    def subsets(n,k):
+        if k == 0:
+            return [[]]
+        return [s + [i] for i in range(n) for s in subsets(i,k-1)]
+    # return mask integers for pattern p translated over n bits
+    def masks(n,p):
+        # use p = (i,j) for a bond from bit i to bit j 
+        m0 = sum(1<<i for i in p) # cast pattern into mask
+        # translate mask m0 along the lattice by n steps
+        ms = [m0<<i for i in range(n)]
+        # note some ms falls in the next period of the lattice
+        M = 1<<n # use M to impose periodic boundary condition
+        return [m//M + m%M for m in ms]
+    # random field
+    hs = numpy.random.uniform(low = -W, high = W, size = L)
+    htotal = sum(hs)
+    # set up states as integers using binary encoding
+    occids = subsets(L, L/2) # occupation indices by k-subsets
+    states = [sum(1<<i for i in state) for state in occids]
+    # creat a map from state to index
+    inds = {state:ind for state, ind in zip(states,range(len(states)))}
+    # generate mask integers for nn and nnn
+    ms1 = masks(L,(0,1))
+    ms2 = masks(L,(0,2))
+    # create a Dictionary Of Keys based sparse matrix for Hamiltonian
+    H = dok_matrix((len(states), len(states)), dtype = numpy.float64)
+    # fill in the Hamiltonian matrix elements
+    for st0 in states:
+        ind0 = inds[st0]
+        # add nn hopping rules
+        for m in ms1:
+            st1 = st0 ^ m
+            if st1 in inds:
+                H[(ind0, inds[st1])] = J1/2
+        # add nnn hopping rules
+        for m in ms2:
+            st1 = st0 ^ m
+            if st1 in inds:
+                H[(ind0, inds[st1])] = J2/2
+        # calculate nn interaction energy
+        e = J1/4*sum((-1)**bin(st0 & m).count('1') for m in ms1)
+        # calculate Zeeman energy
+        e += sum(hs[occids[ind0]]) - htotal/2
+        H[(ind0, ind0)] = e
+    # take an eigen state near energy E
+    es, vs = eigsh(H.tocsc(), k=1, sigma=E)
+    # vs in Sz=0 sector, now need to reconstruct the full wave function
+    psi = numpy.zeros(2**L) # prepare an empty vector
+    for st, v in zip(states, vs[:,0]):
+        psi[st] = v
+    return psi
+''' Entanglement 
+---- input:
+psi::numpy tensor: pure state wave function'''
+# T-shape tensor object
+class Tten(object):
+    def __init__(self, tensor, DL=1, DR=1):
+        if tensor.ndim == 3: # if shape is correct
+            self.tensor = tensor # hold the tensor
+        else: # reshape
+            self.tensor = tensor.reshape((DL,tensor.size//(DL*DR),DR))
+        self.DL, self.D, self.DR = self.tensor.shape
+        self._X = None
+        self._I = None
+    def __repr__(self):
+        return '<T (%d,%d,%d)>'%(self.DL, self.D, self.DR)
+    # SVD split the tensor from the middel
+    def split(self):
+        # infer the number of physical legs
+        L = int(numpy.log2(self.D))
+        # split the physical legs evenly
+        L1 = L//2
+        L2 = L - L1
+        D1, D2 = 2**L1, 2**L2 # corresponding dimensions
+        # reshape to matrix
+        A = self.tensor.reshape((self.DL*D1,D2*self.DR))
+        U, S, V = numpy.linalg.svd(A, full_matrices=False) # reduced SVD
+        DK = S.size # keep bond dimension
+        # absorb S to U and V
+        sqrtS = numpy.sqrt(S)
+        U = U*sqrtS
+        V = sqrtS.reshape((DK,1))*V
+        return Tten(U,DL=self.DL,DR=DK), Tten(V,DL=DK,DR=self.DR)
+    # double tensor
+    def X(self):
+        # if double tensor not calculated
+        if self._X is None: # calculate now
+            # tensor product, transpose and reshape
+            self._X = numpy.tensordot(self.tensor,self.tensor.conj(),axes=0)
+            self._X = self._X.transpose(0,3,1,4,2,5).reshape(
+                        [self.DL**2,self.D,self.D,self.DR**2])
+        return self._X
+    # transfer matrix
+    def I(self):
+        # if transfer matrix not calculated
+        if self._I is None: # calculate now
+            # if double tensor exist
+            if self._X is not None: # calcuate by tensor trace
+                self._I = self._X.trace(axis1=1, axis2=2)
+            else: # calculate by tensor dot
+                self._I = numpy.tensordot(self.tensor,self.tensor.conj(),axes=([1],[1]))
+                self._I = self._I.transpose(0,2,1,3).reshape([self.DL**2,self.DR**2])
+        return self._I
+    # compress the physical legs of the tensor
+    def compress(self):
+        rawI = numpy.tensordot(self.tensor,self.tensor.conj(),axes=([1],[1]))
+        A = rawI.reshape([self.DL*self.DR]*2)
+        w, v = numpy.linalg.eigh(A)
+        v *= numpy.sqrt(w)
+        t = Tten(v.reshape([self.DL,self.DR,self.DL*self.DR]).transpose(0,2,1))
+        t._I = rawI.transpose(0,2,1,3).reshape([self.DL**2,self.DR**2])
+        return t
+# concatenate neiboring T-tensors
+def TT(t1, t2):
+    assert t1.DR == t2.DL, 'Left and right dimensions (%d,%d) not match.'%(t2.DL,t1.DR)
+    t = Tten(numpy.tensordot(t1.tensor,t2.tensor,axes=([2],[0])),
+            DL = t1.DL, DR = t2.DR)
+    if t.D > t.DL*t.DR:
+        t = t.compress()
+    return t
+# Entanglement feature
+class Entanglement(object):
+    def __init__(self, psi):
+        self.psi = psi # hold the wave function
+        self.L = int(numpy.log2(psi.size)) # infer the system size
+        self.Tdict = self.MPS(psi) # construct MPS representation
+        self.Sdict = self.EF() # get entanglement features
+    # construct MPS representation
+    def MPS(self, psi):
+        # recursively decompose the wave function into smaller tensors
+        def decompose(t):
+            if t.D <= 2: # if physical dimension <= 2
+                return t # no further decomposition
+            else: # otherwise split to half
+                return (decompose(t) for t in t.split())
+        # flatten nested iterables
+        from collections.abc import Iterable
+        def flatten(c): # return a generator
+            for x in c:
+                if isinstance(x, Iterable):
+                    yield from flatten(x)
+                else:
+                    yield x
+        return {(i,i+1):t for i, t in enumerate(flatten(decompose(Tten(psi))))}
+    # get T tensor for a consecutive region (begin, end)
+    def getT(self, region):
+        begin, end = region
+        assert begin < end, 'Region begin %d must be smaller than end %d.'%(begin,end)
+        if region not in self.Tdict: # if region not encountered
+            middle = (begin + end)//2 # find middle point
+            # get T for each subregions
+            t1 = self.getT((begin, middle))
+            t2 = self.getT((middle, end))
+            # concatenate, and register to Tdict
+            self.Tdict[region] = TT(t1, t2)
+        return self.Tdict[region]
+    # entanglement entropy for a given configuration
+    # config::list of (1,-1): 1 trivial, -1 swap
+    def entropy(self, config):
+        assert len(config) == self.L, 'Configuration length %d not match system size %d.'%(len(config),self.L)
+        # detect domain walls in config, return a list of wall positions
+        domainwalls = [i+1 for i,q in enumerate(s0!=s1 for s0,s1 in zip(config,config[1:])) if q]
+        # combined with the system start and end -> boundaries
+        boundaries = [0] + domainwalls + [self.L]
+        # prepare a trivial density matrix MPO
+        rho = numpy.array([[[[1.]]]])
+        # enumertate over all regions between boundaries
+        for k, region in enumerate(zip(boundaries, boundaries[1:])):
+            if config[0]*(-1)**k > 0: # trivial region
+                rho = numpy.tensordot(rho,self.getT(region).I(),axes=([3],[0]))
+            else: # swap region
+                rho = numpy.tensordot(rho,self.getT(region).X(),axes=([3],[0]))
+                D0, D1, D2, D3, D4, D5 = rho.shape
+                rho = rho.transpose(0,1,3,2,4,5).reshape([D0,D1*D3,D2*D4,D5])
+        # close MPO loop -> reduced density matrix
+        rho = rho.trace(axis1=0, axis2=3)
+        # entanglement spectrum
+        w = numpy.linalg.eigvalsh(rho)
+        # entanglement entropy (2nd Renyi, in unit of bit)
+        S = -numpy.log2(numpy.sum(w**2))
+        return S
+    # get entanglement features
+    def EF(self):
+        from itertools import product
+        return {config:self.entropy(config) for config in product((-1,1), repeat=self.L)}
+        

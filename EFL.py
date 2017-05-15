@@ -477,7 +477,14 @@ def random_Heisenberg(L = 6, J1 = 1., J2 = 1., W = 5., E = 0.):
         e += sum(hs[occids[ind0]]) - htotal/2
         H[(ind0, ind0)] = e
     # take an eigen state near energy E
-    es, vs = eigsh(H.tocsc(), k=1, sigma=E)
+    H = H.tocsc()
+    v0 = None
+    while True:
+        try:
+            es, vs = eigsh(H, k=1, sigma=E, v0=v0)
+            break
+        except ArpackNoConvergence as err:
+            v0 = err.eigenvectors[:,0]
     # vs in Sz=0 sector, now need to reconstruct the full wave function
     psi = numpy.zeros(2**L) # prepare an empty vector
     for st, v in zip(states, vs[:,0]):
@@ -558,7 +565,9 @@ class Entanglement(object):
         self.psi = psi # hold the wave function
         self.L = int(numpy.log2(psi.size)) # infer the system size
         self.Tdict = self.MPS(psi) # construct MPS representation
-        self.Sdict = self.EF() # get entanglement features
+        from itertools import product
+        self.configs = numpy.asarray(list(product((-1,1), repeat=self.L)))
+        self.weights = numpy.asarray([self.weight(config) for config in self.configs])
     # construct MPS representation
     def MPS(self, psi):
         # recursively decompose the wave function into smaller tensors
@@ -590,7 +599,7 @@ class Entanglement(object):
         return self.Tdict[region]
     # entanglement entropy for a given configuration
     # config::list of (1,-1): 1 trivial, -1 swap
-    def entropy(self, config):
+    def weight(self, config):
         assert len(config) == self.L, 'Configuration length %d not match system size %d.'%(len(config),self.L)
         # detect domain walls in config, return a list of wall positions
         domainwalls = [i+1 for i,q in enumerate(s0!=s1 for s0,s1 in zip(config,config[1:])) if q]
@@ -610,11 +619,23 @@ class Entanglement(object):
         rho = rho.trace(axis1=0, axis2=3)
         # entanglement spectrum
         w = numpy.linalg.eigvalsh(rho)
-        # entanglement entropy (2nd Renyi, in unit of bit)
-        S = -numpy.log2(numpy.sum(w**2))
-        return S
-    # get entanglement features
-    def EF(self):
-        from itertools import product
-        return {config:self.entropy(config) for config in product((-1,1), repeat=self.L)}
+        # return 2nd Renyi entropy weight
+        return numpy.sum(w**2)
+    # entropy can be simply calculated from weight
+    def entropy(self, config):
+        return -numpy.log2(self.weight(config))
+    # return a set of random configurations according to the weight
+    def rand_configs(self, size, subset = None, beta = 1.):
+        # precess the subset indices
+        if subset is None:
+            subset = numpy.array(range(len(self.configs)))
+        else:
+            subset = numpy.asarray(subset)
+        # get probability distribution
+        prob = self.weights[subset]
+        prob = (prob/prob.max())**beta
+        prob = prob/numpy.sum(prob) # normalize
+        # make random choices and return configs
+        return self.configs[numpy.random.choice(subset,size,p=prob)]
+        
         

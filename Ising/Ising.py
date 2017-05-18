@@ -2,9 +2,15 @@
 # package required: numpy, tensorflow
 import tensorflow as tf
 import numpy as np
-sess = tf.Session()
+tfgraph = tf.Graph()
+sess = tf.Session(graph = tfgraph)
 np.set_printoptions(formatter={'float': '{: 0.3f}'.format})
-''' Entanglement Regions'''
+''' Entanglement Region Object
+input:
+    blocks : a list/set of block indices
+    partitions :: int : number of blocks in total
+support method: complement, get equivalent class, convert configuration
+'''
 class Region(object):
     def __init__(self, blocks, partitions):
         self.blocks = frozenset(blocks)
@@ -40,12 +46,17 @@ class Region(object):
                     if eqreg not in known:
                         known.add(eqreg)
                         yield eqreg
-    # map to Ising configuration
+    # map to Ising configuration (as float)
     def config(self):
         # generate an array of ones
         c = np.ones(self.partitions)
         c[list(self.blocks)] = -1. # set blocks to -1
         return c
+''' Entanglement Region Server
+input:
+    partitions :: int : number of entanglement blocks in total
+provides generators to yield entanglement subregions
+'''
 from itertools import combinations
 class Regions(object):
     def __init__(self, partitions):
@@ -69,19 +80,14 @@ class Regions(object):
 input:
     mass :: float : mass of the fermions, in [-1.,1.]
     size :: int : length of the 1D many-body state
-    partitions :: int : number of entanglement mini regions
 '''
 class FreeFermion(object):
-    def __init__(self, mass, size, partitions):
+    def __init__(self, mass, size):
         assert -1. <= mass <= 1., 'mass must be in the range of [-1.,1.].'
         assert size%2 == 0, 'size must be even.'
-        assert size%partitions == 0, 'size must be divisible by partitions.'
         self.mass = mass
         self.size = size
-        self.regions = Regions(partitions)
-        self.blockmap = np.arange(size).reshape((partitions, size//partitions))
-        self.G = self.mkG()
-        return
+        self.G = self.mkG() # store single-particle density matrix
     # construct single-particle density matrix
     def mkG(self):
         u = np.tile([1.+self.mass, 1.-self.mass], self.size//2) # hopping
@@ -90,19 +96,11 @@ class FreeFermion(object):
         (_, U) = np.linalg.eigh(A) # digaonalization
         V = U[:,:self.size//2] # take lower half levels
         return np.dot(V, V.conj().T) # construct density matrix
-    # get sites given a region
-    def sites(self, region):
-        if len(region) > self.regions.partitions//2:
-            return self.sites(region.complement())
-        else:
-            return self.blockmap[list(region)].flatten()
-    # calculate entanglement entropy
-    def S(self, region):
-        # get indices of sites in the region
-        inds = self.sites(region)
-        if len(inds) == 0: return 0.
+    # calculate entanglement entropy given sites
+    def S(self, sites):
+        if len(sites) == 0: return 0.
         # diagonalize reduced density matrix
-        p = np.linalg.eigvalsh(self.G[inds,:][:,inds])
+        p = np.linalg.eigvalsh(self.G[sites,:][:,sites])
         # return 2nd Renyi entropy
         return -np.sum(np.log(abs(p**2 + (1.- p)**2)))
 ''' Ising Models
@@ -111,14 +109,17 @@ input:
     Lz :: int : z direction size
 '''
 from itertools import product
-class SquareModel(object):
+class CylindricalModel(object):
     def __init__(self, Lx, Lz):
         self.Lx = Lx
         self.Lz = Lz
+        # build a index map for sites
         self.inds = {site: i for (i, site) 
             in enumerate(product(range(Lx), range(Lz + 1)))}
-        self.N = len(self.inds)
-        self.cost = self.get_cost()
+        self.N = len(self.inds) # N keeps the number of sites
+        self.partitions = Lx # Lx is also the number of partitions
+        with tfgraph.as_default():
+            self.build() # build model
     # make link, typ = 1,2,3
     def mklink(self, p1, typ):
         (x, z) = p1
@@ -163,80 +164,86 @@ class SquareModel(object):
         # Kronecker product
         Auc = np.kron(A, uc)
         return Auc - Auc.T
-    # get cost function
-    def get_cost(self):
+    # build model
+    def build(self):
         # construct adjacency matrices as constants
-        AJx = tf.constant(
+        TJx = tf.constant(
                 np.array(
                     [self.mkA([(x, z) for x in range(self.Lx)], 1) 
                     for z in range(1, self.Lz)]),
-                dtype = tf.float64, name = 'AJx')
-        AJz = tf.constant(
+                dtype = tf.float64)
+        TJz = tf.constant(
                 np.array(
                     [self.mkA([(x, z) for x in range(self.Lx)], 2) 
                     for z in range(self.Lz)]),
-                dtype = tf.float64, name = 'AJz')
-        Ahl = tf.constant(
+                dtype = tf.float64)
+        Thl = tf.constant(
                 np.array(
                     [self.mkA([(x, 0)], 1) for x in range(self.Lx)]),
-                dtype = tf.float64, name = 'Ah1')
-        Ahr = tf.constant(
+                dtype = tf.float64)
+        Thr = tf.constant(
                 np.array(
                     [self.mkA([(x, self.Lz)], 1) for x in range(self.Lx)]),
-                dtype = tf.float64, name = 'Ah2')
+                dtype = tf.float64)
         Abg = tf.constant(
                 self.mkA(self.inds.keys(), 3),
-                dtype = tf.float64, name = 'Abg')
+                dtype = tf.float64)
         # configurations
-        conf1 = tf.ones([self.Lx], dtype = tf.float64, name = 'conf1') # reference
-        self.confs = tf.placeholder(dtype = tf.float64, name = 'confs')
+        conf0 = tf.zeros([self.Lx], dtype = tf.float64, name = 'conf0') # reference 0
+        conf1 = tf.ones([self.Lx], dtype = tf.float64, name = 'conf1') # reference 1
+        self.confs = tf.placeholder(dtype = tf.float64, 
+                shape = [None, self.Lx], name = 'confs')
         # specify couplings
-        self.Jx = tf.Variable(np.ones(self.Lz - 1), dtype = tf.float64, name = 'Jx')
-        self.Jz = tf.Variable(np.ones(self.Lz), dtype = tf.float64, name = 'Jz')
-        self.Jl = tf.Variable(1., dtype = tf.float64, name = 'Jl')
-        self.Jr = tf.constant(0., dtype = tf.float64, name = 'Jr')
+        with tf.name_scope('J'):
+            self.Jx = tf.Variable(0.1*np.ones(self.Lz - 1), dtype = tf.float64, name = 'Jx')
+            self.Jz = tf.Variable(0.1*np.ones(self.Lz), dtype = tf.float64, name = 'Jz')
+        self.h = tf.Variable(1., dtype = tf.float64, name = 'h')
         # set boundary conditions
-        hl = tf.multiply(self.Jl, self.confs, name = 'hl')
-        hr = tf.multiply(self.Jr, conf1, name = 'hr')
-        hl1 = tf.multiply(self.Jl, conf1, name = 'hl1')
-        hr1 = tf.multiply(self.Jr, conf1, name = 'hr1')
-        # calculate weights
-        wJx = self.wexp(self.Jx, name = 'w_Jx')
-        wJz = self.wexp(self.Jz, name = 'w_Jz')
-        whl = self.wexp(hl, name = 'w_hl')
-        whr = self.wexp(hr, name = 'w_hr')
-        whl1 = self.wexp(hl1, name = 'w_hl1')
-        whr1 = self.wexp(hr1, name = 'w_hr1')
-        # weight contraction
-        wAJx = self.wdotA(wJx, AJx, name = 'A_Jx')
-        wAJz = self.wdotA(wJz, AJz, name = 'A_Jz')
-        wAhl = self.wdotA(whl, Ahl, name = 'A_hl')
-        wAhr = self.wdotA(whr, Ahr, name = 'A_hr')
-        wAhl1 = self.wdotA(whl1, Ahl, name = 'A_hl1')
-        wAhr1 = self.wdotA(whr1, Ahr, name = 'A_hr1')
+        with tf.name_scope('hs'):
+            hl = tf.multiply(self.h, self.confs, name = 'hl')
+            hr = tf.multiply(self.h, conf0, name = 'hr')
+            hl1 = tf.multiply(self.h, conf1, name = 'hl1')
+            hr1 = tf.multiply(self.h, conf0, name = 'hr1')
+        # generate weighted adjacency matrices
+        with tf.name_scope('Ising_net'):
+            AJx = self.dotA(self.Jx, TJx, name = 'A_Jx')
+            AJz = self.dotA(self.Jz, TJz, name = 'A_Jz')
+            Ahl = self.dotA(hl, Thl, name = 'A_hl')
+            Ahr = self.dotA(hr, Thr, name = 'A_hr')
+            Ahl1 = self.dotA(hl1, Thl, name = 'A_hl1')
+            Ahr1 = self.dotA(hr1, Thr, name = 'A_hr1')
         # construct full adjacency matrix
-        with tf.name_scope('A_com'):
-            Acom = wAJx + wAJz + Abg
-        with tf.name_scope('A'):
-            A = Acom + wAhl + wAhr
-        with tf.name_scope('A1'):
-            A1 = Acom + wAhl1 + wAhr1
-        # calcualte free energy
-        F = self.free_energy(A, self.Jx, self.Jz, hl, hr, name = 'F')
-        F1 = self.free_energy(A1, self.Jx, self.Jz, hl1, hr1, name = 'F1')
+            with tf.name_scope('A_com'):
+                Acom = AJx + AJz + Abg
+            with tf.name_scope('A'):
+                A = Acom + Ahl + Ahr
+            with tf.name_scope('A1'):
+                A1 = Acom + Ahl1 + Ahr1
+        # calcualte free energy and model entropy
+        with tf.name_scope('free_energy'):
+            self.F = self.free_energy(A, self.Jx, self.Jz, hl, hr, name = 'F')
+            self.F1 = self.free_energy(A1, self.Jx, self.Jz, hl1, hr1, name = 'F1')
+        self.Smdl = tf.subtract(self.F, self.F1, name = 'S_mdl')
         # calculate cost function
-        self.S = tf.placeholder(dtype = tf.float64, name = 'S')
+        self.Ssys = tf.placeholder(dtype = tf.float64, shape = [None], name = 'S_sys')
         with tf.name_scope('RES'):
-            cost = tf.reduce_sum(tf.square(F - F1 - self.S))
-        return cost
-    # coupling to weight
-    def wexp(self, coupling, name = 'wexp'):
+            self.RES = tf.reduce_sum(tf.square(self.Smdl - self.Ssys))    
+        self.forgetting_rate = tf.constant(0.1, dtype = tf.float64, name = 'forgetting_rate')
+        with tf.name_scope('L2'):
+            self.L2 = self.forgetting_rate*(
+                tf.reduce_sum(tf.square(self.Jx)) 
+                + tf.reduce_sum(tf.square(self.Jz)) 
+                + tf.square(self.h))
+        self.cost = tf.add(self.RES, self.L2, name = 'cost')
+        # providing training handles
+        self.initialize = tf.global_variables_initializer()
+        self.learning_rate = tf.constant(0.01, dtype = tf.float64, name = 'learning_rate')
+        self.optimizer = tf.train.GradientDescentOptimizer(self.learning_rate)
+        self.train = self.optimizer.minimize(self.cost)
+    # convert coupling to weight, and contract with adjacency matrix
+    def dotA(self, f, A, name = 'dotA'):
         with tf.name_scope(name):
-            return tf.exp(-2*coupling)
-    # weight contract with adjacency matrix
-    def wdotA(self, w, A, name = 'wdotA'):
-        with tf.name_scope(name):
-            return tf.tensordot(w, A, axes = 1)
+            return tf.tensordot(tf.exp(-2*f), A, axes = 1)
     # free energy
     def free_energy(self, A, Jx, Jz, hl, hr, name = 'F'):
         with tf.name_scope(name):
@@ -244,8 +251,43 @@ class SquareModel(object):
             Jbg = tf.reduce_sum(Jx, -1) + tf.reduce_sum(Jz, -1)
             hbg = tf.reduce_sum(hl, -1) + tf.reduce_sum(hr, -1)
             return -0.5*lndet - self.Lx*Jbg - hbg
-        
-        
+''' Entanglement Feature Learning
+input:
+    system : object that has a method S to return the entropy
+    model : a model that takes takes  
+'''
+class EFL(object):
+    def __init__(self, system, model):
+        self.system = system
+        self.model = model
+        self.size = system.size
+        self.partitions = model.partitions
+        assert self.size%self.partitions == 0, 'size {0} is not divisible by partitions {1}.'.format(self.size, self.partitions)
+        # set up a entanglement region server
+        self.regions = Regions(self.partitions)
+        # set up a block to site mapping
+        self.blockmap = np.arange(self.size).reshape([self.partitions, self.size//self.partitions])
+    # get sites given a region
+    def sites(self, region):
+        # if the region is over half of the partitions
+        if len(region) > self.partitions//2:
+            # take the complement region instead
+            return self.sites(region.complement())
+        else: # map block indices to site indices
+            return self.blockmap[list(region)].flatten()
+    # send a batch of training set
+    def training_set(self, method, *args):
+        # prepare empty lists for configs and sysS
+        confs = []
+        Ssys = []
+        # go through all regions in the batch
+        for region in getattr(self.regions, method)(*args):
+            # configuration of Ising boundary
+            confs.append(region.config())
+            # entanglement entropy from system
+            Ssys.append(self.system.S(self.sites(region)))
+        # return data as a dict
+        return {self.model.confs: np.array(confs), self.model.Ssys: np.array(Ssys)}
 
 
 

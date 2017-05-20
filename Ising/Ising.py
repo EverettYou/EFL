@@ -63,8 +63,8 @@ class Regions(object):
         self.partitions = partitions
     # representative subregions
     def representatives(self):
-        # size of subregion from 0 to half 
-        for rank in range(self.partitions//2 + 1):
+        # size of subregion from 1 to half 
+        for rank in range(1, self.partitions//2 + 1):
             known = set() # hold the known equivalent subregions
             for blocks in combinations(range(self.partitions), rank):
                 region = Region(blocks, self.partitions) # convert to region
@@ -74,7 +74,7 @@ class Regions(object):
                     yield region # yield the representative region
     # consecutive subregions
     def consecutives(self):
-        for x in range(self.partitions + 1):
+        for x in range(1, self.partitions):
             yield Region(range(0, x), self.partitions)
 ''' Entanglement Entropy (free fermion)
 input:
@@ -87,6 +87,7 @@ class FreeFermion(object):
         assert size%2 == 0, 'size must be even.'
         self.mass = mass
         self.size = size
+        self.info = 'm{0:.2f}_{1}'.format(mass, size)
         self.G = self.mkG() # store single-particle density matrix
     # construct single-particle density matrix
     def mkG(self):
@@ -113,13 +114,16 @@ class CylindricalModel(object):
     def __init__(self, Lx, Lz):
         self.Lx = Lx
         self.Lz = Lz
+        self.info = 'Cyl({0}x{1})'.format(Lx, Lz)
         # build a index map for sites
         self.inds = {site: i for (i, site) 
             in enumerate(product(range(Lx), range(Lz + 1)))}
         self.N = len(self.inds) # N keeps the number of sites
         self.partitions = Lx # Lx is also the number of partitions
+        self.para = {'Jx0': 0.3, 'Jz0': 0.5, 'h': 1., 'fr': 0}
         with tfgraph.as_default():
             self.build() # build model
+            self.pipe() # set up summary
     # make link, typ = 1,2,3
     def mklink(self, p1, typ):
         (x, z) = p1
@@ -195,9 +199,12 @@ class CylindricalModel(object):
                 shape = [None, self.Lx], name = 'confs')
         # specify couplings
         with tf.name_scope('J'):
-            self.Jx = tf.Variable(0.1*np.ones(self.Lz - 1), dtype = tf.float64, name = 'Jx')
-            self.Jz = tf.Variable(0.1*np.ones(self.Lz), dtype = tf.float64, name = 'Jz')
-        self.h = tf.Variable(1., dtype = tf.float64, name = 'h')
+            self.Jx = tf.Variable(self.para['Jx0']*np.ones(self.Lz - 1), 
+                dtype = tf.float64, name = 'Jx')
+            self.Jz = tf.Variable(self.para['Jz0']*np.ones(self.Lz), 
+                dtype = tf.float64, name = 'Jz')
+        self.h = tf.Variable(self.para['h'], dtype = tf.float64, name = 'h')
+        self.vars = [self.Jx, self.Jz, self.h]
         # set boundary conditions
         with tf.name_scope('hs'):
             hl = tf.multiply(self.h, self.confs, name = 'hl')
@@ -226,20 +233,50 @@ class CylindricalModel(object):
         self.Smdl = tf.subtract(self.F, self.F1, name = 'S_mdl')
         # calculate cost function
         self.Ssys = tf.placeholder(dtype = tf.float64, shape = [None], name = 'S_sys')
-        with tf.name_scope('RES'):
-            self.RES = tf.reduce_sum(tf.square(self.Smdl - self.Ssys))    
-        self.forgetting_rate = tf.constant(0.1, dtype = tf.float64, name = 'forgetting_rate')
+        with tf.name_scope('MSE'):
+            self.MSE = tf.reduce_mean(tf.square((self.Smdl - self.Ssys)/self.Ssys))    
         with tf.name_scope('L2'):
+            self.forgetting_rate = tf.Variable(self.para['fr'], trainable = False,
+                dtype = tf.float64, name = 'forgetting_rate')
             self.L2 = self.forgetting_rate*(
                 tf.reduce_sum(tf.square(self.Jx)) 
                 + tf.reduce_sum(tf.square(self.Jz)) 
                 + tf.square(self.h))
-        self.cost = tf.add(self.RES, self.L2, name = 'cost')
+#         self.cost = tf.add(self.MSE, self.L2, name = 'cost')
+        self.cost = self.MSE
         # providing training handles
+        self.optimizer = tf.train.AdamOptimizer(learning_rate=0.02, beta1=0.9, beta2=0.9999, epsilon=1e-8)
+#         self.train = self.optimizer.minimize(self.cost)
+        self.grads_vars = self.optimizer.compute_gradients(self.cost,self.vars)
+        self.train = self.optimizer.apply_gradients(self.grads_vars)
         self.initialize = tf.global_variables_initializer()
-        self.learning_rate = tf.constant(0.01, dtype = tf.float64, name = 'learning_rate')
-        self.optimizer = tf.train.GradientDescentOptimizer(self.learning_rate)
-        self.train = self.optimizer.minimize(self.cost)
+    # set up pipeline for data
+    def pipe(self):
+        tf.summary.scalar('MSE', self.MSE)
+        tf.summary.scalar('L2', self.L2)
+        tf.summary.scalar('cost', self.cost)
+        if hasattr(self.optimizer, 'get_slot_names'):
+            slot_names = self.optimizer.get_slot_names()
+        else:
+            slot_names = []
+        for i in range(self.Lz - 1):
+            tf.summary.scalar('Jx_{0}'.format(i), self.Jx[i])
+            for slot_name in slot_names:
+                tf.summary.scalar('{0}_of_Jx_{1}'.format(slot_name,i), 
+                    self.optimizer.get_slot(self.Jx, slot_name)[i])
+            tf.summary.scalar('grad_Jx_{0}'.format(i),self.grads_vars[0][0][i])
+        for i in range(self.Lz):
+            tf.summary.scalar('Jz_{0}'.format(i), self.Jz[i])
+            for slot_name in slot_names:
+                tf.summary.scalar('{0}_of_Jz_{1}'.format(slot_name,i), 
+                    self.optimizer.get_slot(self.Jz, slot_name)[i])
+            tf.summary.scalar('grad_Jz_{0}'.format(i),self.grads_vars[1][0][i])
+        tf.summary.scalar('h', self.h)
+        for slot_name in slot_names:
+            tf.summary.scalar('{0}_of_h'.format(slot_name), 
+                self.optimizer.get_slot(self.h, slot_name))
+        tf.summary.scalar('grad_h',self.grads_vars[2][0])
+        self.summarize = tf.summary.merge_all()
     # convert coupling to weight, and contract with adjacency matrix
     def dotA(self, f, A, name = 'dotA'):
         with tf.name_scope(name):
@@ -260,13 +297,18 @@ class EFL(object):
     def __init__(self, system, model):
         self.system = system
         self.model = model
+        self.info = ''
         self.size = system.size
         self.partitions = model.partitions
+#         self.initialize = model.initialize
+#         self.train = model.train
+#         self.summarize = model.summarize
         assert self.size%self.partitions == 0, 'size {0} is not divisible by partitions {1}.'.format(self.size, self.partitions)
         # set up a entanglement region server
         self.regions = Regions(self.partitions)
         # set up a block to site mapping
         self.blockmap = np.arange(self.size).reshape([self.partitions, self.size//self.partitions])
+        self.step = 0 # keep track of steps
     # get sites given a region
     def sites(self, region):
         # if the region is over half of the partitions
@@ -277,6 +319,7 @@ class EFL(object):
             return self.blockmap[list(region)].flatten()
     # send a batch of training set
     def training_set(self, method, *args):
+        self.info += '{0:.3}'.format(method)
         # prepare empty lists for configs and sysS
         confs = []
         Ssys = []
@@ -288,6 +331,12 @@ class EFL(object):
             Ssys.append(self.system.S(self.sites(region)))
         # return data as a dict
         return {self.model.confs: np.array(confs), self.model.Ssys: np.array(Ssys)}
+    # provide a writer
+    def writer(self):
+        dir1 = '_'.join([self.system.info, self.model.info, self.info])
+        dir2 = ','.join(['{0}={1:.3g}'.format(name, value) for (name, value) in self.model.para.items()])
+        return tf.summary.FileWriter('./log/'+dir1+'/'+dir2)
+
 
 
 

@@ -130,6 +130,8 @@ class Node(object):
             return self.cell.coordinate + [self.index]
         else:
             raise AttributeError
+    def __repr__(self):
+        return 'Node{0}'.format(self.coordinate)
 # Cell object
 class Cell(object):
     def __init__(self, chain, index, size = 3):
@@ -144,6 +146,8 @@ class Cell(object):
             return len(self)
         else:
             raise AttributeError
+    def __repr__(self):
+        return 'Cell{0}'.format(self.coordinate)
     # getitem method returns the node
     def __getitem__(self, key):
         return self.nodes[key]
@@ -171,6 +175,8 @@ class Chain(object):
             return self.lattice[self.index - 1]
         else:
             raise AttributeError
+    def __repr__(self):
+        return 'Chain{0}'.format(self.coordinate)
     # getitem method returns the cell
     def __getitem__(self, key):
         return self.cells[key]
@@ -192,19 +198,41 @@ class Chain(object):
     def removeIR(self):
         self.remove([cell.index for cell in self.IRcells])
         self.IRcells = []
-# Lattice (single sheet)
-class SSLattice(object):
+# Lattice (base class)
+class Lattice(object):
+    def __init__(self):
+        self.depth = 0
+        self.chains = []
+    # getitem method returns the chain
+    def __getitem__(self, key):
+        return self.chains[key]
+    def __iter__(self):
+        return iter(self.chains)
+    # print lattice structure
+    def print_structure(self, upto = 'node'):
+        print('depth = ',self.depth)
+        if not upto is 'none':
+            for chain in self:
+                print(chain)
+                if not upto is 'chain':
+                    for cell in chain:
+                        if cell in chain.UVcells:
+                            print('├', cell, 'UV')
+                        elif cell in chain.IRcells:
+                            print('├', cell, 'IR')
+                        else:
+                            print('├', cell)
+                        if not upto is 'cell': 
+                            for node in cell:
+                                print('│ ├', node)
+# Single Sheeted Lattice (subclass of Lattice) 
+class SSLattice(Lattice):
     def __init__(self, width, depth, pattern = [-1,1]):
         self.width = width
         self.depth = depth
         self.info = 'SSLatt[{0},{1},{2}]'.format(width,depth,pattern)
         self.chains = []
         self.build(pattern)
-    # getitem method returns the chain
-    def __getitem__(self, key):
-        return self.chains[key]
-    def __iter__(self):
-        return iter(self.chains)
     # build lattice according to the pattern
     # pattern = (p_1,p_2,...,p_n) with p_i = +1 for IR, -1 for UV
     def build(self, pattern):
@@ -236,16 +264,29 @@ class SSLattice(object):
                 break # break z loop
         # final touch: remove the IR cells from the top chain
         self[-1].removeIR()
-        # build lattice graph
-        self.build_graph()
-    # build lattice graph (directed)
-    def build_graph(self, depth = None):
-        # get the depth
-        if depth is None:
+        # collect nodes and links
+        self.collect()
+    # collect nodes and links (as directed graph) upto specified depth
+    def collect(self, depth = None):
+        # four dictionaries will be generated
+        # node_dict = {node: ind, ...} maps Node object to its global index
+        #                              in the lattice graph
+        # slot_dict = {'input': {lbl: ind, ...}, 
+        #              'parameter': {lbl: ind, ...}}
+        #       collects and classifies slots into inputs and parameters
+        #       keeps the slot label to global index mapping
+        #       the slot index -> the slice index in the adjacency tensor   
+        # adj_dict = {'constant': [[(i,j), ±1.] ...],
+        #             'input': [[(s,i,j), ±1.] ...],
+        #             'parameter': [[(s,i,j), ±1.] ...]}
+        #       stores the instructions to make the adjacency tensor
+        # size = {'node': *, 'input': *, 'parameter': *, 'variable': *}
+        #       keeps the size information of nodes, inputs and parameters
+        if depth is None: # the depth of the lattice to be collected
             depth = self.depth
-        else: # prevent depth beyond bound
+        else: # prevent depth to go beyond bound
             depth = min(depth, self.depth)
-        # prepare
+        # prepare dicts
         self.node_dict = {}
         self.slot_dict = {}
         self.adj_dict = {}
@@ -256,36 +297,37 @@ class SSLattice(object):
             lkinfo = ('constant',) # constant type 
             for cell in chain:
                 self.mk_link(cell[0], cell[1], info = lkinfo)
-            for cell in chain.IRcells:
-                self.mk_link(cell[0], cell[2], info = lkinfo)
-                self.mk_link(cell[2], cell[1], info = lkinfo)
             for cell in chain.UVcells:
                 self.mk_link(cell[0], cell[2], info = lkinfo)
                 self.mk_link(cell[1], cell[2], info = lkinfo)
+            for cell in chain.IRcells:
+                self.mk_link(cell[0], cell[2], info = lkinfo)
+                self.mk_link(cell[2], cell[1], info = lkinfo)
             # inter-cell links
-            # horizontal links
+            # horizontal (dual) links
             for cell in chain:
                 x = cell.index # keep cell index in x
                 # determine the link type
                 if z == 0: # for input layer
-                    lkinfo = ('input', x) # input type
+                    lkinfo = ('input', '{0}'.format(x)) # input type
                 elif z == depth - 1: # for top layer
                     lkinfo = ('constant',) # constant type
                 else: # for the rest of the bulk layers
-                    lkinfo = ('parameter', 'x{0}'.format(z)) # parameter type
-                if x == 0:
+                    lkinfo = ('parameter', '{0}M'.format(z)) # parameter type
+                if x == 0: # for the boundary link: reverse direction
                     self.mk_link(chain[0][0], chain[-1][1], info = lkinfo)
-                else:
+                else: # for the remaining links: normal direction
                     self.mk_link(chain[x-1][1], chain[x][0], info = lkinfo)
-            # vertical links
+            # vertical (dual) links
             if z < depth - 1: # if not the top layer
                 chainIR = chain.IR # get the IR chain
                 for (cell0, cell1) in zip(chain.IRcells, chainIR.UVcells):
-                    lkinfo = ('parameter', 'z{0}'.format(z))
+                    lkinfo = ('parameter', '{0}H'.format(z))
                     self.mk_link(cell0[2], cell1[2], info = lkinfo)
         # set sizes
         self.size = {typ: len(lbls) for (typ, lbls) in self.slot_dict.items()}
         self.size['node'] = len(self.node_dict)
+        self.size['variable'] = self.size['parameter'] + 1
     # make link
     def mk_link(self, node0, node1, info):
         # get node indices
@@ -322,19 +364,19 @@ class SSLattice(object):
         else: # if type is unknown
             self.slot_dict[typ] = {label: 0} # create a label dict of the type
             return 0 # return the index
-    # add to adjacency matrix
+    # add to adjacency tensor instruction
     def add_to_adj(self, typ, pair):
         # if the type has been registered
         if typ in self.adj_dict: # type is there
             self.adj_dict[typ].append(pair) # add the pair
         else: # the type has not been estabilished
             self.adj_dict[typ] = [pair] # estabilish the type with the pair
-    # return adjacency matrix
-    def adjmat(self, typ):
-        # switch by type, create empty tensors
-        if typ == 'constant':
+    # return adjacency tensor
+    def adjten(self, typ):
+        # create empty tensors, shape assigned according to type
+        if typ == 'constant': # constant type -> matrix
             A = np.zeros(shape = [self.size['node'], self.size['node']])
-        elif typ in {'input', 'parameter'}:
+        elif typ in {'input', 'parameter'}: # other types -> tensor
             A = np.zeros(shape = [self.size[typ], self.size['node'], self.size['node']])
         # filling in the tensor according to adj_dict
         for (p, v) in self.adj_dict[typ]:
@@ -355,41 +397,43 @@ class IsingModel(object):
         self.partitions = lattice.size['input']
     # build model
     def build(self):
-        # setup adjacency matrices as constants
-        A_bg = tf.constant(self.lattice.adjmat('constant'),dtype = tf.float64)
-        As_h = tf.constant(self.lattice.adjmat('input'),dtype = tf.float64)
-        As_J = tf.constant(self.lattice.adjmat('parameter'),dtype = tf.float64)
-        # configurations
-        conf0 = tf.ones([self.partitions], dtype = tf.float64, name = 'conf0')
-        self.confs = tf.placeholder(dtype = tf.float64, 
-                shape = [None, self.partitions], name = 'confs')
-        # specify couplings
-        self.J = tf.Variable(np.random.rand(self.lattice.size['parameter']), 
-                dtype = tf.float64, name = 'J')
-        # set boundary conditions
-#         with tf.name_scope('h&h0'):
-        with tf.name_scope('h'):
-            h = self.J[0] * self.confs
-        with tf.name_scope('h0'):
-            h0 = self.J[0] * conf0
+        # setup adjacency tensors as TF constants
+        A_bg = tf.constant(self.lattice.adjten('constant'),dtype = tf.float64)
+        As_in = tf.constant(self.lattice.adjten('input'),dtype = tf.float64)
+        As_pa = tf.constant(self.lattice.adjten('parameter'),dtype = tf.float64)
+        # input and default (boundary Ising configurations)
+        default = tf.ones([self.partitions], dtype = tf.float64, name = 'default')
+        self.input = tf.placeholder(dtype = tf.float64, 
+                shape = [None, self.partitions], name = 'input')
+        # variable (external field and coupling strengths)
+        self.variable = tf.Variable(np.random.rand(self.lattice.size['variable']), 
+                dtype = tf.float64, name = 'variable')
+        with tf.name_scope('gain'):
+            self.gain = self.variable[0] # external field strength
+        with tf.name_scope('parameter'):
+            self.parameter = self.variable[1:] # coupling strengths
+        # input preprocessing
+        with tf.name_scope('level_ctrl'):
+            hs = self.gain * self.input
+            h0 = self.gain * default
         # generate weighted adjacency matrices
-        with tf.name_scope('A'):
-            A_J = self.dotA(self.J, As_J, name = 'A_J')
-            A_h = self.dotA(h, As_h, name = 'A_h')
-            A_h0 = self.dotA(h0, As_h, name = 'A_h0')
+        with tf.name_scope('Ising_net'):
+            A_pa = self.dotA(self.parameter, As_pa, name = 'A_pa')
+            A_hs = self.dotA(hs, As_in, name = 'A_hs')
+            A_h0 = self.dotA(h0, As_in, name = 'A_h0')
             # construct full adjacency matrix
-            A_com = A_J + A_bg
-            A = A_com + A_h
+            A_com = A_pa + A_bg
+            As = A_com + A_hs
             A0 = A_com + A_h0
         # calcualte free energy and model entropy
-#         with tf.name_scope('F&F0'):
-        self.F = self.free_energy(A, self.J, h, name = 'F')
-        self.F0 = self.free_energy(A0, self.J, h0, name = 'F0')
-        self.Smdl = tf.subtract(self.F, self.F0, name = 'S_mdl')
+        with tf.name_scope('free_energy'):
+            self.Fs = self.free_energy(As, self.parameter, hs, name = 'Fs')
+            self.F0 = self.free_energy(A0, self.parameter, h0, name = 'F0')
+        self.prediction = tf.subtract(self.Fs, self.F0, name = 'prediction')
         # calculate cost function
-        self.Ssys = tf.placeholder(dtype = tf.float64, shape = [None], name = 'S_sys')
+        self.label = tf.placeholder(dtype = tf.float64, shape = [None], name = 'label')
         with tf.name_scope('cost'):
-            self.cost = tf.reduce_mean(tf.square((self.Smdl - self.Ssys)/self.Ssys))
+            self.cost = tf.reduce_mean(tf.square(self.prediction/self.label - 1.))
     # convert coupling to weight, and contract with adjacency matrix
     def dotA(self, coupling, A, name = 'dotA'):
         with tf.name_scope(name):
@@ -451,7 +495,7 @@ class EFData(object):
             # entanglement entropy from system
             Ssys.append(self.system.S(self.sites(region)))
         # return data as a dict
-        return {self.model.confs: np.array(confs), self.model.Ssys: np.array(Ssys)}
+        return {self.model.input: np.array(confs), self.model.label: np.array(Ssys)}
     # iter approach
     # set up data source
     def fill(self, method):
@@ -481,7 +525,7 @@ class EFL(object):
             self.step = tf.Variable(0, name='step', trainable=False)
             self.optimizer = tf.train.AdamOptimizer(
                     learning_rate=0.02, beta1=0.9, beta2=0.9999, epsilon=1e-8)
-            self.grads_vars = self.optimizer.compute_gradients(self.model.cost, [self.model.J])
+            self.grads_vars = self.optimizer.compute_gradients(self.model.cost, [self.model.variable])
             self.trainer = self.optimizer.apply_gradients(self.grads_vars, global_step = self.step)
 #             self.trainer = self.optimizer.minimize(self.model.cost, global_step = self.step)
             self.initializer = tf.global_variables_initializer()
@@ -497,22 +541,23 @@ class EFL(object):
             self.session.run(self.trainer, self.data.source)
             if i%check == 0:
                 self.writer.add_summary(*self.session.run([self.summary, self.step], self.data.source))
-        return self.session.run((self.model.cost, self.model.J), self.data.source)
+        return self.session.run((self.model.cost, self.model.variable), self.data.source)
     # pipe data (by summary)
     def pipe(self):
         # record cost function
-        tf.summary.scalar('C/cost', self.model.cost)
-        tf.summary.scalar('C/logcost', tf.log(self.model.cost))
-        tf.summary.histogram('S_mdl', self.model.Smdl)
+        tf.summary.scalar('cost/cost', self.model.cost)
+        tf.summary.scalar('cost/logcost', tf.log(self.model.cost))
+        tf.summary.histogram('prediction', self.model.prediction)
         # get optimizer slots
         slot_names = self.optimizer.get_slot_names()
-        J_names = {i:name for (name, i) in self.model.lattice.slot_dict['parameter'].items()}
+        var_names = {i+1:name for (name, i) in self.model.lattice.slot_dict['parameter'].items()}
+        var_names[0] = '0I'
         # go through each component of J
         for i in range(self.model.lattice.size['parameter']):
-            tf.summary.scalar('J/{0}/a'.format(J_names[i]), self.model.J[i])
-            tf.summary.scalar('J/{0}/g'.format(J_names[i]), self.grads_vars[0][0][i])
+            tf.summary.scalar('var/{0}/c'.format(var_names[i]), self.model.variable[i])
+            tf.summary.scalar('var/{0}/g'.format(var_names[i]), self.grads_vars[0][0][i])
             for slot_name in slot_names:
-                tf.summary.scalar('J/{0}/{1}'.format(J_names[i], slot_name), self.optimizer.get_slot(self.model.J, slot_name)[i])
+                tf.summary.scalar('var/{0}/{1}'.format(var_names[i], slot_name), self.optimizer.get_slot(self.model.variable, slot_name)[i])
         self.summary = tf.summary.merge_all()
         self.writer = self.get_writer()
         self.writer.add_graph(self.graph) # writter add graph

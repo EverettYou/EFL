@@ -322,7 +322,7 @@ class SSLattice(Lattice):
             if z < depth - 1: # if not the top layer
                 chainIR = chain.IR # get the IR chain
                 for (cell0, cell1) in zip(chain.IRcells, chainIR.UVcells):
-                    lkinfo = ('parameter', '{0}H'.format(z))
+                    lkinfo = ('parameter', '{0}M'.format(z + 1))
                     self.mk_link(cell0[2], cell1[2], info = lkinfo)
         # set sizes
         self.size = {typ: len(lbls) for (typ, lbls) in self.slot_dict.items()}
@@ -433,7 +433,9 @@ class IsingModel(object):
         # calculate cost function
         self.label = tf.placeholder(dtype = tf.float64, shape = [None], name = 'label')
         with tf.name_scope('cost'):
-            self.cost = tf.reduce_mean(tf.square(self.prediction/self.label - 1.))
+            self.MSE = tf.reduce_mean(tf.square(self.prediction/self.label - 1.))
+            self.wall = tf.reduce_sum(tf.nn.relu(-self.variable))
+            self.cost = self.MSE + self.wall 
     # convert coupling to weight, and contract with adjacency matrix
     def dotA(self, coupling, A, name = 'dotA'):
         with tf.name_scope(name):
@@ -524,9 +526,11 @@ class EFL(object):
             # providing training handles
             self.step = tf.Variable(0, name='step', trainable=False)
             self.optimizer = tf.train.AdamOptimizer(
-                    learning_rate=0.02, beta1=0.9, beta2=0.9999, epsilon=1e-8)
-            self.grads_vars = self.optimizer.compute_gradients(self.model.cost, [self.model.variable])
-            self.trainer = self.optimizer.apply_gradients(self.grads_vars, global_step = self.step)
+                    learning_rate=0.1, beta1=0.98, beta2=0.9999, epsilon=1e-8)
+#             self.grads_vars = self.optimizer.compute_gradients(self.model.cost, [self.model.variable])
+            self.grads_vars = self.optimizer.compute_gradients(self.model.cost)
+            self.trainer = self.optimizer.apply_gradients(self.grads_vars, 
+                            global_step = self.step)
 #             self.trainer = self.optimizer.minimize(self.model.cost, global_step = self.step)
             self.initializer = tf.global_variables_initializer()
             self.pipe() # set up data pipeline
@@ -536,7 +540,7 @@ class EFL(object):
         self.session.run(self.initializer) # initialize graph
         self.data.initialize(data_method) # initialize data server
     # train machine
-    def train(self, steps, check = 10):
+    def train(self, steps, check = 100):
         for i in range(steps):
             self.session.run(self.trainer, self.data.source)
             if i%check == 0:
@@ -545,19 +549,23 @@ class EFL(object):
     # pipe data (by summary)
     def pipe(self):
         # record cost function
-        tf.summary.scalar('cost/cost', self.model.cost)
-        tf.summary.scalar('cost/logcost', tf.log(self.model.cost))
-        tf.summary.histogram('prediction', self.model.prediction)
-        # get optimizer slots
-        slot_names = self.optimizer.get_slot_names()
+#         tf.summary.scalar('cost/MSE', self.model.MSE)
+        tf.summary.scalar('cost/logMSE', tf.log(self.model.MSE))
+        tf.summary.scalar('cost/wall', tf.log(self.model.wall))
+#         tf.summary.histogram('prediction', self.model.prediction)
+        # get variable names
         var_names = {i+1:name for (name, i) in self.model.lattice.slot_dict['parameter'].items()}
         var_names[0] = '0I'
         # go through each component of J
-        for i in range(self.model.lattice.size['parameter']):
-            tf.summary.scalar('var/{0}/c'.format(var_names[i]), self.model.variable[i])
-            tf.summary.scalar('var/{0}/g'.format(var_names[i]), self.grads_vars[0][0][i])
-            for slot_name in slot_names:
-                tf.summary.scalar('var/{0}/{1}'.format(var_names[i], slot_name), self.optimizer.get_slot(self.model.variable, slot_name)[i])
+        for i in range(self.model.lattice.size['variable']):
+            tf.summary.scalar('variable/{0}'.format(var_names[i]), self.grads_vars[0][1][i])
+            tf.summary.scalar('gradient/{0}'.format(var_names[i]), self.grads_vars[0][0][i])
+        # optimizer slots
+        slot_names = self.optimizer.get_slot_names()
+        for slot_name in slot_names:
+            slot = self.optimizer.get_slot(self.model.variable, slot_name)
+            for i in range(self.model.lattice.size['variable']):
+                tf.summary.scalar('{0}/{1}'.format(slot_name, var_names[i]), slot[i])
         self.summary = tf.summary.merge_all()
         self.writer = self.get_writer()
         self.writer.add_graph(self.graph) # writter add graph

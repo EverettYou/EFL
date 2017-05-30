@@ -1,8 +1,34 @@
 ''' Entanglement Feature Learning '''
-# package required: numpy, tensorflow
-import tensorflow as tf
+# global import: numpy, tensorflow
 import numpy as np
 np.set_printoptions(formatter={'float': '{: 0.3f}'.format})
+import tensorflow as tf
+# define the op logdet and its gradient
+# from https://gist.github.com/harpone/3453185b41d8d985356cbe5e57d67342
+# Define custom py_func which takes also a grad op as argument:
+def py_func(func, inp, Tout, stateful=True, name=None, grad=None):
+    # Need to generate a unique name to avoid duplicates:
+    rnd_name = 'PyFuncGrad' + str(np.random.randint(0, 1E+8))
+    tf.RegisterGradient(rnd_name)(grad)  # see _MySquareGrad for grad example
+    g = tf.get_default_graph()
+    with g.gradient_override_map({"PyFunc": rnd_name}):
+        return tf.py_func(func, inp, Tout, stateful=stateful, name=name)
+# from tensorflow/python/ops/linalg_grad.py
+# Gradient for logdet
+def logdet_grad(op, grad):
+    a = op.inputs[0]
+    a_adj_inv = tf.matrix_inverse(a, adjoint=True)
+    out_shape = tf.concat([tf.shape(a)[:-2], [1, 1]], axis=0)
+    return tf.reshape(grad, out_shape) * a_adj_inv
+# define logdet by calling numpy.linalg.slogdet
+def logdet(a, name = None):
+    with tf.name_scope(name, 'LogDet', [a]) as name:
+        res = py_func(lambda a: np.linalg.slogdet(a)[1], 
+                      [a], 
+                      tf.float64, 
+                      name=name, 
+                      grad=logdet_grad) # set the gradient
+        return res
 ''' Entanglement Region Server '''
 # entanglement region object
 class Region(object):
@@ -126,7 +152,7 @@ class Node(object):
         self.cell = cell # father cell
         self.index = index
     def __getattr__(self, attr):
-        if attr is 'coordinate':
+        if attr == 'coordinate':
             return self.cell.coordinate + [self.index]
         else:
             raise AttributeError
@@ -140,9 +166,9 @@ class Cell(object):
         # set up a list of nodes
         self.nodes = [Node(self, i) for i in range(size)]
     def __getattr__(self, attr):
-        if attr is 'coordinate':
+        if attr == 'coordinate':
             return self.chain.coordinate + [self.index]
-        elif attr is 'size':
+        elif attr == 'size':
             return len(self)
         else:
             raise AttributeError
@@ -165,13 +191,13 @@ class Chain(object):
         self.UVcells = []
         self.IRcells = []
     def __getattr__(self, attr):
-        if attr is 'coordinate':
+        if attr == 'coordinate':
             return [self.index]
-        elif attr is 'size':
+        elif attr == 'size':
             return len(self)
-        elif attr is 'IR':
+        elif attr == 'IR':
             return self.lattice[self.index + 1]
-        elif attr is 'UV':
+        elif attr == 'UV':
             return self.lattice[self.index - 1]
         else:
             raise AttributeError
@@ -211,10 +237,10 @@ class Lattice(object):
     # print lattice structure
     def print_structure(self, upto = 'node'):
         print('depth = ',self.depth)
-        if not upto is 'none':
+        if not upto == 'none':
             for chain in self:
                 print(chain)
-                if not upto is 'chain':
+                if not upto == 'chain':
                     for cell in chain:
                         if cell in chain.UVcells:
                             print('├', cell, 'UV')
@@ -222,7 +248,7 @@ class Lattice(object):
                             print('├', cell, 'IR')
                         else:
                             print('├', cell)
-                        if not upto is 'cell': 
+                        if not upto == 'cell': 
                             for node in cell:
                                 print('│ ├', node)
 # Single Sheeted Lattice (subclass of Lattice) 
@@ -271,17 +297,17 @@ class SSLattice(Lattice):
         # four dictionaries will be generated
         # node_dict = {node: ind, ...} maps Node object to its global index
         #                              in the lattice graph
-        # slot_dict = {'input': {lbl: ind, ...}, 
-        #              'parameter': {lbl: ind, ...}}
-        #       collects and classifies slots into inputs and parameters
+        # slot_dict = {'wh': {lbl: ind, ...}, 
+        #              'wJ': {lbl: ind, ...}}
+        #       collects and classifies slots into wh and wJ weights
         #       keeps the slot label to global index mapping
         #       the slot index -> the slice index in the adjacency tensor   
-        # adj_dict = {'constant': [[(i,j), ±1.] ...],
-        #             'input': [[(s,i,j), ±1.] ...],
-        #             'parameter': [[(s,i,j), ±1.] ...]}
+        # adj_dict = {'1': [[(i,j), ±1.] ...],
+        #             'wh': [[(s,i,j), ±1.] ...],
+        #             'wJ': [[(s,i,j), ±1.] ...]}
         #       stores the instructions to make the adjacency tensor
-        # size = {'node': *, 'input': *, 'parameter': *, 'variable': *}
-        #       keeps the size information of nodes, inputs and parameters
+        # size = {'node': *, 'wh': *, 'wJ': *}
+        #       keeps the size information of nodes, wh and wJ
         if depth is None: # the depth of the lattice to be collected
             depth = self.depth
         else: # prevent depth to go beyond bound
@@ -294,7 +320,7 @@ class SSLattice(Lattice):
         for chain in self[:depth]:
             z = chain.index # keep chain index in z
             # intra-cell links
-            lkinfo = ('constant',) # constant type 
+            lkinfo = ('1',) # constant 1
             for cell in chain:
                 self.mk_link(cell[0], cell[1], info = lkinfo)
             for cell in chain.UVcells:
@@ -309,11 +335,11 @@ class SSLattice(Lattice):
                 x = cell.index # keep cell index in x
                 # determine the link type
                 if z == 0: # for input layer
-                    lkinfo = ('input', '{0}'.format(x)) # input type
+                    lkinfo = ('wh', x) # weight of h
                 elif z == depth - 1: # for top layer
-                    lkinfo = ('constant',) # constant type
+                    lkinfo = ('1',) # constant 1
                 else: # for the rest of the bulk layers
-                    lkinfo = ('parameter', '{0}M'.format(z)) # parameter type
+                    lkinfo = ('wJ', z) # weight of J
                 if x == 0: # for the boundary link: reverse direction
                     self.mk_link(chain[0][0], chain[-1][1], info = lkinfo)
                 else: # for the remaining links: normal direction
@@ -322,22 +348,21 @@ class SSLattice(Lattice):
             if z < depth - 1: # if not the top layer
                 chainIR = chain.IR # get the IR chain
                 for (cell0, cell1) in zip(chain.IRcells, chainIR.UVcells):
-                    lkinfo = ('parameter', '{0}M'.format(z + 1))
+                    lkinfo = ('wJ', z + 1) # weight of J
                     self.mk_link(cell0[2], cell1[2], info = lkinfo)
         # set sizes
         self.size = {typ: len(lbls) for (typ, lbls) in self.slot_dict.items()}
         self.size['node'] = len(self.node_dict)
-        self.size['variable'] = self.size['parameter'] + 1
     # make link
     def mk_link(self, node0, node1, info):
         # get node indices
         (ind0, ind1) = (self.get_node_index(node) for node in (node0, node1))
         # switch by link type
         typ = info[0]
-        if typ == 'constant':
+        if typ == '1':
             self.add_to_adj(typ, [(ind0, ind1), +1.])
             self.add_to_adj(typ, [(ind1, ind0), -1.])
-        elif typ in {'input', 'parameter'}:
+        elif typ.startswith('w'): # wh or wJ
             indv = self.get_slot_index(info)
             self.add_to_adj(typ, [(indv, ind0, ind1), +1.])
             self.add_to_adj(typ, [(indv, ind1, ind0), -1.])
@@ -374,78 +399,85 @@ class SSLattice(Lattice):
     # return adjacency tensor
     def adjten(self, typ):
         # create empty tensors, shape assigned according to type
-        if typ == 'constant': # constant type -> matrix
+        if typ == '1': # constant type -> matrix
             A = np.zeros(shape = [self.size['node'], self.size['node']])
-        elif typ in {'input', 'parameter'}: # other types -> tensor
+        elif typ.startswith('w'): # other types -> tensor
             A = np.zeros(shape = [self.size[typ], self.size['node'], self.size['node']])
+        else:
+            raise ValueError('Lattice.adjten receives unknown type "{0}".'.format(typ))
         # filling in the tensor according to adj_dict
         for (p, v) in self.adj_dict[typ]:
             A[p] = v
         return A
     # return link count vector
     def lcvect(self, typ):
-        if typ in {'input', 'parameter'}:
+        if typ.startswith('w'):
             lc = np.zeros(shape = [self.size[typ]]) # prepare to count links
             for [(a, _, _), _] in self.adj_dict[typ]:
                 lc[a] += 0.5 # to mod out double counting
+        else:
+            raise ValueError('Lattice.lcvect receives unknown type "{0}".'.format(typ))
         return lc
 ''' Ising Model '''
 class IsingModel(object):
     def __init__(self, lattice):
         self.lattice = lattice
         self.info = 'Ising[{0}]'.format(lattice.info)
-        self.partitions = lattice.size['input']
-    # build model
-    def build(self):
+        self.partitions = lattice.size['wh']
+    # build model (given input bound dimension D)
+    def build(self, D):
         # setup adjacency tensors as TF constants
-        A_bg = tf.constant(self.lattice.adjten('constant'),dtype = tf.float64)
-        As_in = tf.constant(self.lattice.adjten('input'),dtype = tf.float64)
-        As_pa = tf.constant(self.lattice.adjten('parameter'),dtype = tf.float64)
-        # input and default (boundary Ising configurations)
-        default = tf.ones([self.partitions], dtype = tf.float64, name = 'default')
-        self.input = tf.placeholder(dtype = tf.float64, 
-                shape = [None, self.partitions], name = 'input')
-        # variable (external field and coupling strengths)
-        self.variable = tf.Variable(np.random.rand(self.lattice.size['variable']), 
-                dtype = tf.float64, name = 'variable')
-        with tf.name_scope('gain'):
-            self.gain = self.variable[0] # external field strength
-        with tf.name_scope('parameter'):
-            self.parameter = self.variable[1:] # coupling strengths
-        # input preprocessing
-        with tf.name_scope('level_ctrl'):
-            hs = self.gain * self.input
-            h0 = self.gain * default
+        A_bg = tf.constant(self.lattice.adjten('1'),dtype = tf.float64, name = 'A_bg')
+        As_h = tf.constant(self.lattice.adjten('wh'),dtype = tf.float64, name = 'As_h')
+        As_J = tf.constant(self.lattice.adjten('wJ'),dtype = tf.float64, name = 'As_J')
+        # boundary Ising configurations
+        conf0 = tf.ones([self.partitions], dtype = tf.float64, name = 'conf0')
+        self.confs = tf.placeholder(dtype = tf.float64, 
+                shape = [None, self.partitions], name = 'confs')
+        # coupling strength (trainable variable)
+        self.J = tf.Variable(np.zeros(self.lattice.size['wJ']), 
+                dtype = tf.float64, name = 'J')
+        # external field configurations
+        with tf.name_scope('h'):
+            h = np.log(D)/2 # external field strength
+            hs = h * self.confs
+            h0 = h * conf0
         # generate weighted adjacency matrices
         with tf.name_scope('Ising_net'):
-            A_pa = self.dotA(self.parameter, As_pa, name = 'A_pa')
-            A_hs = self.dotA(hs, As_in, name = 'A_hs')
-            A_h0 = self.dotA(h0, As_in, name = 'A_h0')
+            A_J = self.wdotA(self.J, As_J, name = 'A_J')
+            A_hs = self.wdotA(hs, As_h, name = 'A_hs')
+            A_h0 = self.wdotA(h0, As_h, name = 'A_h0')
             # construct full adjacency matrix
-            A_com = A_pa + A_bg
-            As = A_com + A_hs
-            A0 = A_com + A_h0
+            As = A_hs + A_bg + A_J
+            A0 = A_h0 + A_bg + A_J
         # calcualte free energy and model entropy
         with tf.name_scope('free_energy'):
-            self.Fs = self.free_energy(As, self.parameter, hs, name = 'Fs')
-            self.F0 = self.free_energy(A0, self.parameter, h0, name = 'F0')
-        self.prediction = tf.subtract(self.Fs, self.F0, name = 'prediction')
+#             self.Fs = self.free_energy(As, self.J, hs, name = 'Fs')
+#             self.F0 = self.free_energy(A0, self.J, h0, name = 'F0')
+            self.Fs = self.free_energy_logdet(As, self.J, hs, name = 'Fs')
+            self.F0 = self.free_energy_logdet(A0, self.J, h0, name = 'F0')
+        self.Smdl = tf.subtract(self.Fs, self.F0, name = 'S_mdl')
         # calculate cost function
-        self.label = tf.placeholder(dtype = tf.float64, shape = [None], name = 'label')
+        self.Ssys = tf.placeholder(dtype = tf.float64, shape = [None], name = 'S_sys')
         with tf.name_scope('cost'):
-            self.MSE = tf.reduce_mean(tf.square(self.prediction/self.label - 1.))
-            self.wall = tf.reduce_sum(tf.nn.relu(-self.variable))
-            self.cost = self.MSE + self.wall 
+            self.MSE = tf.reduce_mean(tf.square(self.Smdl/self.Ssys - 1.))
+            self.wall = tf.reduce_sum(tf.nn.relu(-self.J))
+            self.L2 = tf.nn.l2_loss(self.J)
+            self.cost = self.MSE + 5.*self.wall #+ 0.001 * self.L2
+            # record cost function
+            tf.summary.scalar('logMSE', tf.log(self.MSE))
+            tf.summary.scalar('wall', self.wall)
+            tf.summary.scalar('L2', self.L2)
     # convert coupling to weight, and contract with adjacency matrix
-    def dotA(self, coupling, A, name = 'dotA'):
+    def wdotA(self, f, A, name = 'wdotA'):
         with tf.name_scope(name):
-            return tf.tensordot(tf.exp(2.*coupling), A, axes = 1)
-    # free energy
+            return tf.tensordot(tf.exp(2. * f), A, axes = 1)
+    # free energy (use regularization)
     def free_energy(self, A, J, h, name = 'F'):
         with tf.name_scope(name):
             with tf.name_scope('Jh'):
-                Js = J * tf.constant(self.lattice.lcvect('parameter'), name = 'J_count')
-                hs = h * tf.constant(self.lattice.lcvect('input'), name = 'h_count')
+                Js = J * tf.constant(self.lattice.lcvect('wJ'), name = 'J_count')
+                hs = h * tf.constant(self.lattice.lcvect('wh'), name = 'h_count')
                 with tf.name_scope('ramp'):
                     rmp = tf.reduce_sum(tf.nn.relu(Js)) + tf.reduce_sum(tf.nn.relu(hs), -1)
                 with tf.name_scope('abs'):
@@ -456,10 +488,20 @@ class IsingModel(object):
                     factor_ten = tf.reshape(factor, tf.concat([tf.shape(factor),[1,1]],0))
                 Areg = factor_ten * A
             with tf.name_scope('logdet'):
-                logdet = tf.log(tf.matrix_determinant(Areg))
+                logdetA = tf.log(tf.matrix_determinant(Areg))
             with tf.name_scope('collect'):
-                F = -0.5*logdet - abs
+                F = -0.5*logdetA - abs
             return F
+    # free energy (use logdet)
+    def free_energy_logdet(self, A, J, h, name = 'F'):
+        with tf.name_scope(name):
+            with tf.name_scope('Jh'):
+                Js = J * tf.constant(self.lattice.lcvect('wJ'), name = 'J_count')
+                hs = h * tf.constant(self.lattice.lcvect('wh'), name = 'h_count')
+                F0 = tf.reduce_sum(Js) + tf.reduce_sum(hs, -1)
+            logdetA = logdet(A)
+            F = -0.5*logdetA + F0
+        return F
 ''' Entanglement Feature Learning
 input:
     system : object that has a method S to return the entropy
@@ -472,11 +514,12 @@ class EFData(object):
         self.model = model
         self.size = system.size
         self.partitions = model.partitions
-        assert self.size%self.partitions == 0, 'size {0} is not divisible by partitions {1}.'.format(self.size, self.partitions)
+        assert self.size%self.partitions == 0, 'Size not divisible by partitions.'
+        self.D = self.size // self.partitions
         # set up a entanglement region server
         self.region_server = RegionServer(self.partitions)
         # set up a block to site mapping
-        self.blockmap = np.arange(self.size).reshape([self.partitions, self.size//self.partitions])
+        self.blockmap = np.arange(self.size).reshape([self.partitions, self.D])
     # get sites given a region
     def sites(self, region):
         # if the region is over half of the partitions
@@ -497,7 +540,7 @@ class EFData(object):
             # entanglement entropy from system
             Ssys.append(self.system.S(self.sites(region)))
         # return data as a dict
-        return {self.model.input: np.array(confs), self.model.label: np.array(Ssys)}
+        return {self.model.confs: np.array(confs), self.model.Ssys: np.array(Ssys)}
     # iter approach
     # set up data source
     def fill(self, method):
@@ -522,16 +565,16 @@ class EFL(object):
     # build machine
     def build(self):
         with self.graph.as_default():
-            self.model.build()
-            # providing training handles
+            self.model.build(self.data.D)
+            # providing handles
             self.step = tf.Variable(0, name='step', trainable=False)
             self.optimizer = tf.train.AdamOptimizer(
-                    learning_rate=0.1, beta1=0.98, beta2=0.9999, epsilon=1e-8)
-#             self.grads_vars = self.optimizer.compute_gradients(self.model.cost, [self.model.variable])
-            self.grads_vars = self.optimizer.compute_gradients(self.model.cost)
-            self.trainer = self.optimizer.apply_gradients(self.grads_vars, 
+                    learning_rate=0.02, beta1=0.8, beta2=0.9999, epsilon=1e-8)
+#             self.grads_vars = self.optimizer.compute_gradients(self.model.cost)
+#             self.trainer = self.optimizer.apply_gradients(self.grads_vars, 
+#                             global_step = self.step)
+            self.trainer = self.optimizer.minimize(self.model.cost, 
                             global_step = self.step)
-#             self.trainer = self.optimizer.minimize(self.model.cost, global_step = self.step)
             self.initializer = tf.global_variables_initializer()
             self.pipe() # set up data pipeline
     # initialize machine
@@ -540,35 +583,28 @@ class EFL(object):
         self.session.run(self.initializer) # initialize graph
         self.data.initialize(data_method) # initialize data server
     # train machine
-    def train(self, steps, check = 100):
+    def train(self, steps, check = 20):
         for i in range(steps):
             self.session.run(self.trainer, self.data.source)
             if i%check == 0:
                 self.writer.add_summary(*self.session.run([self.summary, self.step], self.data.source))
-        return self.session.run((self.model.cost, self.model.variable), self.data.source)
+        return self.session.run((self.model.MSE, self.model.J), self.data.source)
     # pipe data (by summary)
     def pipe(self):
-        # record cost function
-#         tf.summary.scalar('cost/MSE', self.model.MSE)
-        tf.summary.scalar('cost/logMSE', tf.log(self.model.MSE))
-        tf.summary.scalar('cost/wall', tf.log(self.model.wall))
-#         tf.summary.histogram('prediction', self.model.prediction)
         # get variable names
-        var_names = {i+1:name for (name, i) in self.model.lattice.slot_dict['parameter'].items()}
-        var_names[0] = '0I'
+        var_names = {i:name for name, i in self.model.lattice.slot_dict['wJ'].items()}
         # go through each component of J
-        for i in range(self.model.lattice.size['variable']):
-            tf.summary.scalar('variable/{0}'.format(var_names[i]), self.grads_vars[0][1][i])
-            tf.summary.scalar('gradient/{0}'.format(var_names[i]), self.grads_vars[0][0][i])
+        for i in range(self.model.lattice.size['wJ']):
+            tf.summary.scalar('J/{0}'.format(var_names[i]), self.model.J[i])
         # optimizer slots
         slot_names = self.optimizer.get_slot_names()
         for slot_name in slot_names:
-            slot = self.optimizer.get_slot(self.model.variable, slot_name)
-            for i in range(self.model.lattice.size['variable']):
+            slot = self.optimizer.get_slot(self.model.J, slot_name)
+            for i in range(self.model.lattice.size['wJ']):
                 tf.summary.scalar('{0}/{1}'.format(slot_name, var_names[i]), slot[i])
         self.summary = tf.summary.merge_all()
         self.writer = self.get_writer()
-        self.writer.add_graph(self.graph) # writter add graph
+#         self.writer.add_graph(self.graph) # writter add graph
     # get a writer (set log file path here)
     def get_writer(self):
         # dir1 = ''.join([self.system.info, self.model.info, self.info])

@@ -39,6 +39,7 @@ class Region(object):
     def __init__(self, blocks, partitions):
         self.blocks = frozenset(blocks)
         self.partitions = partitions
+        self._config = None
     def __len__(self):
         return len(self.blocks)
     def __iter__(self):
@@ -72,16 +73,20 @@ class Region(object):
                         yield eqreg
     # map to Ising configuration (as float)
     def config(self):
-        # generate an array of ones
-        c = np.ones(self.partitions)
-        c[list(self.blocks)] = -1. # set blocks to -1
+        if self._config is None: # if config not cached
+            # generate an array of ones
+            c = np.ones(self.partitions)
+            c[list(self.blocks)] = -1. # set blocks to -1
+            self._config = c # keep the config
+        else: # if config cached
+            c = self._config # retrived the cache
         return c
 # entanglement region server
 from itertools import combinations
 class RegionServer(object):
     def __init__(self, partitions):
         self.partitions = partitions
-    # set region source
+    # set filler by method
     def fill(self, method):
         if isinstance(method, str):
             self.filler = getattr(self, method)
@@ -89,7 +94,7 @@ class RegionServer(object):
         elif isinstance(method, tuple):
             self.filler = getattr(self, method[0])
             self.fargs = method[1:]
-        self.pool = self.filler(*self.fargs)
+        self.pool = self.filler(*self.fargs) # fill the pool
     # fetch regions (with auto-refill)
     def fetch(self, batch = None):
         if batch is None: # get all remaining regions in the source
@@ -104,30 +109,45 @@ class RegionServer(object):
                     region = next(self.pool) # get again
                 yield region
     # representative subregions
-    def representatives(self):
-        # size of subregion from 1 to half 
-        for rank in range(1, self.partitions//2 + 1):
-            known = set() # hold the known equivalent subregions
-            for blocks in combinations(range(self.partitions), rank):
-                region = Region(blocks, self.partitions) # convert to region
-                if region not in known: # if region unknown
-                    # add equivalent regions to known
-                    known.update(region.equivalences())
-                    yield region # yield the representative region
+    def representative(self):
+        # check for cache
+        if hasattr(self, 'representative_cache'): # if chache exist
+            # use chache
+            for region in self.representative_cache:
+                yield region
+        else: # if chache not established, built it
+            self.representative_cache = []
+            # size of subregion from 1 to half 
+            for rank in range(1, self.partitions//2 + 1):
+                known = set() # hold the known equivalent subregions
+                for blocks in combinations(range(self.partitions), rank):
+                    region = Region(blocks, self.partitions) # convert to region
+                    if region not in known: # if region unknown
+                        # add equivalent regions to known
+                        known.update(region.equivalences())
+                        self.representative_cache.append(region)
+                        yield region # yield the representative region
     # consecutive subregions
-    def consecutives(self):
-        for x in range(1, self.partitions):
+    def consecutive(self):
+        for x in range(1, self.partitions//2+1):
             yield Region(range(0, x), self.partitions)
+    # random subregions
+    def random(self, pool_size = 8):
+        for k in range(pool_size):
+            conf = np.random.randint(2, size=self.partitions-1)
+            blocks = {0} ^ {i + 1 for i, x in enumerate(conf) if x == 1}
+            yield Region(blocks, self.partitions)
 ''' Physical System '''
 class FreeFermion(object):
 # input:
 #     mass :: float : mass of the fermions, in [-1.,1.]
 #     size :: int : length of the 1D many-body state
-    def __init__(self, mass, size):
+    def __init__(self, mass, size, c = 1):
         assert -1. <= mass <= 1., 'mass must be in the range of [-1.,1.].'
         assert size%2 == 0, 'size must be even.'
         self.mass = mass
         self.size = size
+        self.c = c # central charge
         self.info = 'FF[m{0:.2f},{1}]'.format(mass, size)
         self.G = self.mkG() # store single-particle density matrix
     # construct single-particle density matrix
@@ -144,7 +164,8 @@ class FreeFermion(object):
         # diagonalize reduced density matrix
         p = np.linalg.eigvalsh(self.G[sites,:][:,sites])
         # return 2nd Renyi entropy
-        return -np.sum(np.log(abs(p**2 + (1.- p)**2)))
+        s = -np.sum(np.log(abs(p**2 + (1.- p)**2)))
+        return self.c*s
 ''' Lattice System '''
 # Node object
 class Node(object):
@@ -424,8 +445,8 @@ class IsingModel(object):
         self.lattice = lattice
         self.info = 'Ising[{0}]'.format(lattice.info)
         self.partitions = lattice.size['wh']
-    # build model (given input bound dimension D)
-    def build(self, D):
+    # build model (given input log bound dimension lnD)
+    def build(self, lnD):
         # setup adjacency tensors as TF constants
         A_bg = tf.constant(self.lattice.adjten('1'),dtype = tf.float64, name = 'A_bg')
         As_h = tf.constant(self.lattice.adjten('wh'),dtype = tf.float64, name = 'As_h')
@@ -434,14 +455,14 @@ class IsingModel(object):
         conf0 = tf.ones([self.partitions], dtype = tf.float64, name = 'conf0')
         self.confs = tf.placeholder(dtype = tf.float64, 
                 shape = [None, self.partitions], name = 'confs')
+        # external field configurations
+        with tf.name_scope('h'):
+            self.h = tf.constant(lnD/2., name = 'h') # external field strength
+            hs = self.h * self.confs
+            h0 = self.h * conf0
         # coupling strength (trainable variable)
         self.J = tf.Variable(np.zeros(self.lattice.size['wJ']), 
                 dtype = tf.float64, name = 'J')
-        # external field configurations
-        with tf.name_scope('h'):
-            h = np.log(D)/2 # external field strength
-            hs = h * self.confs
-            h0 = h * conf0
         # generate weighted adjacency matrices
         with tf.name_scope('Ising_net'):
             A_J = self.wdotA(self.J, As_J, name = 'A_J')
@@ -452,48 +473,30 @@ class IsingModel(object):
             A0 = A_h0 + A_bg + A_J
         # calcualte free energy and model entropy
         with tf.name_scope('free_energy'):
-#             self.Fs = self.free_energy(As, self.J, hs, name = 'Fs')
-#             self.F0 = self.free_energy(A0, self.J, h0, name = 'F0')
-            self.Fs = self.free_energy_logdet(As, self.J, hs, name = 'Fs')
-            self.F0 = self.free_energy_logdet(A0, self.J, h0, name = 'F0')
+            self.Fs = self.free_energy(As, self.J, hs, name = 'Fs')
+            self.F0 = self.free_energy(A0, self.J, h0, name = 'F0')
         self.Smdl = tf.subtract(self.Fs, self.F0, name = 'S_mdl')
         # calculate cost function
         self.Ssys = tf.placeholder(dtype = tf.float64, shape = [None], name = 'S_sys')
         with tf.name_scope('cost'):
             self.MSE = tf.reduce_mean(tf.square(self.Smdl/self.Ssys - 1.))
-            self.wall = tf.reduce_sum(tf.nn.relu(-self.J))
+            self.wall1 = tf.reduce_sum(tf.nn.relu(-self.J))
+            self.wall2 = tf.square(tf.reduce_sum(tf.nn.relu(self.J[1:]-self.J[:-1])))
             self.L2 = tf.nn.l2_loss(self.J)
-            self.cost = self.MSE + 5.*self.wall #+ 0.001 * self.L2
+            self.cost = self.MSE #+ 0.01 * self.L2 #+ 0.001 * self.wall2 + self.wall1 
             # record cost function
             tf.summary.scalar('logMSE', tf.log(self.MSE))
-            tf.summary.scalar('wall', self.wall)
+            tf.summary.scalar('logwall1', tf.log(self.wall1 + 1.e-10))
+            tf.summary.scalar('logwall2', tf.log(self.wall2 + 1.e-10))
             tf.summary.scalar('L2', self.L2)
+        # gating
+        self.gate = self.mk_gate(0.95)
     # convert coupling to weight, and contract with adjacency matrix
     def wdotA(self, f, A, name = 'wdotA'):
         with tf.name_scope(name):
             return tf.tensordot(tf.exp(2. * f), A, axes = 1)
-    # free energy (use regularization)
-    def free_energy(self, A, J, h, name = 'F'):
-        with tf.name_scope(name):
-            with tf.name_scope('Jh'):
-                Js = J * tf.constant(self.lattice.lcvect('wJ'), name = 'J_count')
-                hs = h * tf.constant(self.lattice.lcvect('wh'), name = 'h_count')
-                with tf.name_scope('ramp'):
-                    rmp = tf.reduce_sum(tf.nn.relu(Js)) + tf.reduce_sum(tf.nn.relu(hs), -1)
-                with tf.name_scope('abs'):
-                    abs = tf.reduce_sum(tf.abs(Js)) + tf.reduce_sum(tf.abs(hs), -1)
-            with tf.name_scope('regularize'):
-                with tf.name_scope('factor'):
-                    factor = tf.exp(-4./self.lattice.size['node'] * rmp)
-                    factor_ten = tf.reshape(factor, tf.concat([tf.shape(factor),[1,1]],0))
-                Areg = factor_ten * A
-            with tf.name_scope('logdet'):
-                logdetA = tf.log(tf.matrix_determinant(Areg))
-            with tf.name_scope('collect'):
-                F = -0.5*logdetA - abs
-            return F
     # free energy (use logdet)
-    def free_energy_logdet(self, A, J, h, name = 'F'):
+    def free_energy(self, A, J, h, name = 'F'):
         with tf.name_scope(name):
             with tf.name_scope('Jh'):
                 Js = J * tf.constant(self.lattice.lcvect('wJ'), name = 'J_count')
@@ -502,6 +505,16 @@ class IsingModel(object):
             logdetA = logdet(A)
             F = -0.5*logdetA + F0
         return F
+    # gating the coupling
+    def mk_gate(self, beta3, name = 'gate'):
+        with tf.name_scope(name):
+            Jrelu = tf.nn.relu(self.J)
+            Jbnd = tf.scan(tf.minimum, Jrelu, back_prop=False)
+            Jmax = tf.concat([tf.reshape(self.h,[1]),Jbnd[:-1]],axis=0)
+            self.Javgmax = tf.Variable(np.zeros(self.lattice.size['wJ']), trainable=False)
+            Jreg = tf.minimum(Jrelu, (Jrelu + self.Javgmax)/2.)
+            gate = [self.J.assign(Jreg), self.Javgmax.assign(beta3*self.Javgmax + (1-beta3)*Jmax)]
+            return gate        
 ''' Entanglement Feature Learning
 input:
     system : object that has a method S to return the entropy
@@ -509,17 +522,19 @@ input:
 '''
 # entanglement feature data server
 class EFData(object):
-    def __init__(self, system, model):
-        self.system = system
+    def __init__(self, model, system):
         self.model = model
+        self.system = system
         self.size = system.size
         self.partitions = model.partitions
         assert self.size%self.partitions == 0, 'Size not divisible by partitions.'
-        self.D = self.size // self.partitions
+        self.blocksize = self.size // self.partitions
+        self.lnD = self.blocksize * self.system.c * np.log(2.)
         # set up a entanglement region server
         self.region_server = RegionServer(self.partitions)
+        self.method = None
         # set up a block to site mapping
-        self.blockmap = np.arange(self.size).reshape([self.partitions, self.D])
+        self.blockmap = np.arange(self.size).reshape([self.partitions, self.blocksize])
     # get sites given a region
     def sites(self, region):
         # if the region is over half of the partitions
@@ -541,54 +556,56 @@ class EFData(object):
             Ssys.append(self.system.S(self.sites(region)))
         # return data as a dict
         return {self.model.confs: np.array(confs), self.model.Ssys: np.array(Ssys)}
-    # iter approach
-    # set up data source
-    def fill(self, method):
-        self.region_server.fill(method)
     # fetch data
-    def fetch(self, batch = None):
+    def fetch(self, method, batch = None):
+        if method != self.method: # if method changed
+            self.method = method # update method state
+            self.region_server.fill(method) # fill the server by new method
         return self.pack(self.region_server.fetch(batch))
-    # non iter approach
-    def initialize(self, method):
-        self.region_server.fill(method)
-        self.source = self.pack(self.region_server.fetch())
 # EFL machine
 from datetime import datetime
 class EFL(object):
-    def __init__(self, system, model):
-        self.system = system
+    def __init__(self, model, system):
         self.model = model
+        self.system = system
+        self.data_server = EFData(model, system)
         self.info = ''
-        self.data = EFData(system, model)
         self.graph = tf.Graph()
         self.session = tf.Session(graph = self.graph)
+        self.build() # build machine and initialize
     # build machine
     def build(self):
         with self.graph.as_default():
-            self.model.build(self.data.D)
+            self.model.build(self.data_server.lnD)
             # providing handles
-            self.step = tf.Variable(0, name='step', trainable=False)
+            self.step = tf.Variable(0,name='step',trainable=False)
+            self.learning_rate = tf.placeholder(tf.float32,shape=[],name='learning_Rate')
+            self.beta1 = tf.placeholder(tf.float32,shape=[],name='beta1')
+            self.beta2 = tf.placeholder(tf.float32,shape=[],name='beta2')
+            self.epsilon = tf.placeholder(tf.float32,shape=[],name='epsilon')
             self.optimizer = tf.train.AdamOptimizer(
-                    learning_rate=0.02, beta1=0.8, beta2=0.9999, epsilon=1e-8)
-#             self.grads_vars = self.optimizer.compute_gradients(self.model.cost)
-#             self.trainer = self.optimizer.apply_gradients(self.grads_vars, 
-#                             global_step = self.step)
+                    learning_rate=self.learning_rate, 
+                    beta1=self.beta1, 
+                    beta2=self.beta2, 
+                    epsilon=self.epsilon)
             self.trainer = self.optimizer.minimize(self.model.cost, 
                             global_step = self.step)
             self.initializer = tf.global_variables_initializer()
             self.pipe() # set up data pipeline
-    # initialize machine
-    def initialize(self, data_method = 'representatives'):
-        self.build() # build machine
-        self.session.run(self.initializer) # initialize graph
-        self.data.initialize(data_method) # initialize data server
+        self.initialized = False
     # train machine
-    def train(self, steps, check = 20):
+    def train(self, steps=1, method='representative', batch=None, check=20, learning_rate=0.02, beta1=0.9, beta2=0.999, epsilon=1e-8):
+        self.para = {self.learning_rate:learning_rate, self.beta1:beta1, self.beta2:beta2, self.epsilon:epsilon}
+        if not self.initialized: # if not initialized yet
+            self.session.run(self.initializer, self.para) # initialize graph
+            self.initialized = True
         for i in range(steps):
-            self.session.run(self.trainer, self.data.source)
+            self.feed = {**self.para, **self.data_server.fetch(method, batch)}
+            self.session.run(self.trainer, self.feed)
+            self.session.run(self.model.gate)
             if i%check == 0:
-                self.writer.add_summary(*self.session.run([self.summary, self.step], self.data.source))
-        return self.session.run((self.model.MSE, self.model.J), self.data.source)
+                self.writer.add_summary(*self.session.run(self.summary, self.feed))
+        return self.session.run((self.model.MSE, self.model.J), self.feed)
     # pipe data (by summary)
     def pipe(self):
         # get variable names
@@ -602,7 +619,7 @@ class EFL(object):
             slot = self.optimizer.get_slot(self.model.J, slot_name)
             for i in range(self.model.lattice.size['wJ']):
                 tf.summary.scalar('{0}/{1}'.format(slot_name, var_names[i]), slot[i])
-        self.summary = tf.summary.merge_all()
+        self.summary = [tf.summary.merge_all(), self.step]
         self.writer = self.get_writer()
 #         self.writer.add_graph(self.graph) # writter add graph
     # get a writer (set log file path here)

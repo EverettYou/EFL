@@ -1,0 +1,2 @@
+model_checkpoint_path: "Ising(SSLatt(16,100,UUI))FF(32,0.00,8.0)random"
+all_model_checkpoint_paths: "Ising(SSLatt(16,100,UUI))FF(32,0.00,8.0)random"

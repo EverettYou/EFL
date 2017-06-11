@@ -495,14 +495,18 @@ class IsingModel(object):
         conf0 = tf.ones([self.partitions], dtype = tf.float64, name = 'conf0')
         self.confs = tf.placeholder(dtype = tf.float64, 
                 shape = [None, self.partitions], name = 'confs')
+        # trainable variable
+        self.hJlen = self.lattice.size['wJ'] + 1
+        self.hJ = tf.Variable(0.5 * np.ones(self.hJlen), 
+                dtype = tf.float64, name = 'hJ')
         # external field configurations
         with tf.name_scope('h'):
-            self.h = lnD/2. # external field strength
+            self.h = self.hJ[0] # external field strength
             hs = self.h * self.confs
             h0 = self.h * conf0
-        # coupling strength (trainable variable)
-        self.J = tf.Variable(0.5 * np.ones(self.lattice.size['wJ']), 
-                dtype = tf.float64, name = 'J')
+        # Ising coupling
+        with tf.name_scope('J'):
+            self.J = self.hJ[1:]
         # generate weighted adjacency matrices
         with tf.name_scope('Ising_net'):
             A_J = self.wdotA(self.J, As_J, name = 'A_J')
@@ -518,10 +522,10 @@ class IsingModel(object):
         self.Smdl = tf.subtract(self.Fs, self.F0, name = 'S_mdl')
         # calculate cost function
         self.Ssys = tf.placeholder(dtype = tf.float64, shape = [None], name = 'S_sys')
-        with tf.name_scope('cost'):
+        with tf.name_scope('loss'):
             self.MSE = tf.reduce_mean(tf.square(self.Smdl/self.Ssys - 1.))
             self.wall = tf.reduce_sum(tf.nn.relu(self.J[1:]-self.J[:-1]))
-            self.cost = self.MSE
+            self.loss = self.MSE
             # record cost function
             tf.summary.scalar('logMSE', tf.log(self.MSE))
             tf.summary.scalar('logwall', tf.log(self.wall + 1.e-10))
@@ -618,7 +622,9 @@ class Machine(object):
                             beta1=self.beta1, 
                             beta2=self.beta2, 
                             epsilon=self.epsilon)
-            self.trainer = self.optimizer.minimize(self.model.cost, 
+            self.trainer = self.optimizer.minimize(
+                            self.model.loss,
+                            var_list = [self.model.hJ],
                             global_step = self.step)
             self.initializer = tf.global_variables_initializer()
             self.regularizer = self.regularize() # set up regularizer
@@ -652,28 +658,26 @@ class Machine(object):
                 self.writer.add_summary(*self.session.run(self.summary, self.feed))
     # pipe data (by summary)
     def pipe(self):
-        # get variable names
-        var_names = {i:name for name, i in self.model.lattice.slot_dict['wJ'].items()}
         # go through each component of J
-        for i in range(self.model.lattice.size['wJ']):
-            tf.summary.scalar('J/{0}'.format(var_names[i]), self.model.J[i])
+        for i in range(self.model.hJlen):
+            tf.summary.scalar('hJ/{0}'.format(i), self.model.hJ[i])
         # optimizer slots
         slot_names = self.optimizer.get_slot_names()
         for slot_name in slot_names:
-            slot = self.optimizer.get_slot(self.model.J, slot_name)
-            for i in range(self.model.lattice.size['wJ']):
-                tf.summary.scalar('{0}/{1}'.format(slot_name, var_names[i]), slot[i])
+            slot = self.optimizer.get_slot(self.model.hJ, slot_name)
+            for i in range(self.model.hJlen):
+                tf.summary.scalar('{0}/{1}'.format(slot_name, i), slot[i])
         self.summary = [tf.summary.merge_all(), self.step]
         timestamp = datetime.now().strftime('%d%H%M%S')
         return tf.summary.FileWriter('./log/' + timestamp)
     # regularize the coupling
     def regularize(self):
         with tf.name_scope('regularizer'):
-            Jrelu = tf.nn.relu(self.model.J) # first remove negative couplings
+            hJrelu = tf.nn.relu(self.model.hJ) # first remove negative couplings
             # construct the upper bond
-            Jmax = tf.concat([tf.reshape(self.model.h,[1]),Jrelu[:-1]],axis=0)
+            hJmax = tf.concat([tf.reshape(hJrelu[0],[1]),hJrelu[:-1]],axis=0)
             # clip by the upper bond and assign to J
-            return self.model.J.assign(tf.minimum(Jrelu, Jmax))        
+            return self.model.hJ.assign(tf.minimum(hJrelu, hJmax))        
     # graph export for visualization in TensorBoard 
     def add_graph(self):
         self.writer.add_graph(self.graph) # writter add graph

@@ -17,17 +17,21 @@ def py_func(func, inp, Tout, stateful=True, name=None, grad=None):
 # Gradient for logdet
 def logdet_grad(op, grad):
     a = op.inputs[0]
-    a_adj_inv = tf.matrix_inverse(a, adjoint=True)
+    a_adj_inv = tf.check_numerics(
+                    tf.matrix_inverse(a, adjoint=True), 
+                    'zero determinant')
     out_shape = tf.concat([tf.shape(a)[:-2], [1, 1]], axis=0)
     return tf.reshape(grad, out_shape) * a_adj_inv
 # define logdet by calling numpy.linalg.slogdet
 def logdet(a, name = None):
     with tf.name_scope(name, 'LogDet', [a]) as name:
-        res = py_func(lambda a: np.linalg.slogdet(a)[1], 
+        res = tf.check_numerics(
+                py_func(lambda x: np.linalg.slogdet(x)[1], 
                       [a], 
                       tf.float64, 
                       name=name, 
-                      grad=logdet_grad) # set the gradient
+                      grad=logdet_grad), # set the gradient
+                'zero determinant')
         return res
 ''' Entanglement Region Server '''
 # entanglement region object
@@ -199,8 +203,8 @@ class FreeFermion(object):
         # diagonalize reduced density matrix
         p = np.linalg.eigvalsh(self.G[sites,:][:,sites])
         # return 2nd Renyi entropy
-        s = -np.sum(np.log(abs(p**2 + (1.- p)**2)))
-        return self.c*s
+        S = -self.c * np.sum(np.log(np.abs(p**2 + (1.- p)**2)))
+        return S
 ''' Lattice System '''
 # Node object
 class Node(object):
@@ -493,11 +497,11 @@ class IsingModel(object):
                 shape = [None, self.partitions], name = 'confs')
         # external field configurations
         with tf.name_scope('h'):
-            self.h = tf.constant(lnD/2., name = 'h') # external field strength
+            self.h = lnD/2. # external field strength
             hs = self.h * self.confs
             h0 = self.h * conf0
         # coupling strength (trainable variable)
-        self.J = tf.Variable(np.zeros(self.lattice.size['wJ']), 
+        self.J = tf.Variable(0.5 * np.ones(self.lattice.size['wJ']), 
                 dtype = tf.float64, name = 'J')
         # generate weighted adjacency matrices
         with tf.name_scope('Ising_net'):
@@ -516,15 +520,11 @@ class IsingModel(object):
         self.Ssys = tf.placeholder(dtype = tf.float64, shape = [None], name = 'S_sys')
         with tf.name_scope('cost'):
             self.MSE = tf.reduce_mean(tf.square(self.Smdl/self.Ssys - 1.))
-            self.wall1 = tf.reduce_sum(tf.nn.relu(-self.J))
-            self.wall2 = tf.square(tf.reduce_sum(tf.nn.relu(self.J[1:]-self.J[:-1])))
-            self.L2 = tf.nn.l2_loss(self.J)
-            self.cost = self.MSE #+ 0.01*self.wall2 #+ 0.01 * self.L2 # + self.wall1 
+            self.wall = tf.reduce_sum(tf.nn.relu(self.J[1:]-self.J[:-1]))
+            self.cost = self.MSE
             # record cost function
             tf.summary.scalar('logMSE', tf.log(self.MSE))
-            tf.summary.scalar('logwall1', tf.log(self.wall1 + 1.e-10))
-            tf.summary.scalar('logwall2', tf.log(self.wall2 + 1.e-10))
-            tf.summary.scalar('L2', self.L2)
+            tf.summary.scalar('logwall', tf.log(self.wall + 1.e-10))
     # convert coupling to weight, and contract with adjacency matrix
     def wdotA(self, f, A, name = 'wdotA'):
         with tf.name_scope(name):
@@ -597,7 +597,8 @@ class Machine(object):
         self.graph = tf.Graph()
         self.session = tf.Session(graph = self.graph)
         self.build() # build machine
-        self.initialized = False # initialization flag
+        # initialization flag (should not initialize here)
+        self.initialized = False
     def __getattr__(self, attr):
         if attr == 'info':
             return self.model.info+self.system.info+''.join(str(x) for x in self.method)
@@ -607,27 +608,26 @@ class Machine(object):
     def build(self):
         with self.graph.as_default():
             self.model.build(self.data_server.lnD)
-            # providing handles
             self.step = tf.Variable(0,name='step',trainable=False)
-            self.learning_rate = tf.placeholder(tf.float32,shape=[],name='learning_Rate')
+            self.learning_rate = tf.placeholder(tf.float32,shape=[],name='learning_rate')
             self.beta1 = tf.placeholder(tf.float32,shape=[],name='beta1')
             self.beta2 = tf.placeholder(tf.float32,shape=[],name='beta2')
             self.epsilon = tf.placeholder(tf.float32,shape=[],name='epsilon')
             self.optimizer = tf.train.AdamOptimizer(
-                    learning_rate=self.learning_rate, 
-                    beta1=self.beta1, 
-                    beta2=self.beta2, 
-                    epsilon=self.epsilon)
+                            learning_rate=self.learning_rate, 
+                            beta1=self.beta1, 
+                            beta2=self.beta2, 
+                            epsilon=self.epsilon)
             self.trainer = self.optimizer.minimize(self.model.cost, 
                             global_step = self.step)
             self.initializer = tf.global_variables_initializer()
-            self.regularize() # set up regularizer
-            self.pipe() # set up data pipeline
+            self.regularizer = self.regularize() # set up regularizer
+            self.writer = self.pipe() # set up data pipeline
             self.saver = tf.train.Saver() # add saver
-            self.graph.finalize()
+        return self
     # train machine
     def train(self, steps=1, check=20, method=None, batch=None, 
-            learning_rate=0.02, beta1=0.9, beta2=0.999, epsilon=1e-8):
+            learning_rate=0.005, beta1=0.9, beta2=0.9, epsilon=1e-8):
         if method is None:
             method = self.method # by default, use global method
         else:
@@ -641,10 +641,14 @@ class Machine(object):
             self.session.run(self.initializer, self.para) # initialize graph
             self.initialized = True
         for i in range(steps):
+            # construct the feed dict, attache data to para
             self.feed = {**self.para, **self.data_server.fetch(method, batch)}
-            self.session.run(self.trainer, self.feed)
-            self.session.run(self.regularizer)
-            if self.session.run(self.step)%check == 0:
+            try: # zero determinant may cause a problem, try it
+                self.session.run(self.trainer, self.feed) # train one step
+            except tf.errors.InvalidArgumentError: # when things go wrong
+                continue # skip the rest, go the the next batch of data
+            self.session.run(self.regularizer) # run regularization
+            if self.session.run(self.step)%check == 0: # summarize
                 self.writer.add_summary(*self.session.run(self.summary, self.feed))
     # pipe data (by summary)
     def pipe(self):
@@ -661,26 +665,45 @@ class Machine(object):
                 tf.summary.scalar('{0}/{1}'.format(slot_name, var_names[i]), slot[i])
         self.summary = [tf.summary.merge_all(), self.step]
         timestamp = datetime.now().strftime('%d%H%M%S')
-        self.writer = tf.summary.FileWriter('./log/' + timestamp)
-    # gating the coupling
+        return tf.summary.FileWriter('./log/' + timestamp)
+    # regularize the coupling
     def regularize(self):
         with tf.name_scope('regularizer'):
-            Jrelu = tf.nn.relu(self.model.J)
+            Jrelu = tf.nn.relu(self.model.J) # first remove negative couplings
+            # construct the upper bond
             Jmax = tf.concat([tf.reshape(self.model.h,[1]),Jrelu[:-1]],axis=0)
-            self.regularizer = self.model.J.assign(tf.minimum(Jrelu, Jmax))        
-    # add graph
+            # clip by the upper bond and assign to J
+            return self.model.J.assign(tf.minimum(Jrelu, Jmax))        
+    # graph export for visualization in TensorBoard 
     def add_graph(self):
         self.writer.add_graph(self.graph) # writter add graph
     # save session
     def save(self):
-        path = './machine/'+self.info
-        path = self.saver.save(self.session, path, write_meta_graph=False)
+        # save model, without saving the graph
+        path = self.saver.save(self.session, './machine/'+self.info, 
+                                write_meta_graph=False)
         print('INFO:tensorflow:Saving parameters to %s'%path)
     # load session
     def load(self):
-        path = './machine/'+self.info
-        self.saver.restore(self.session, path)
-        self.initialized = True # session initialized after loading       
+        # restore model
+        self.saver.restore(self.session, './machine/'+self.info)
+        # session is initialized after loading 
+        self.initialized = True      
+# Toolbox 
+# I/O 
+# JSON pickle: export to communicate with Mathematica 
+import jsonpickle
+def export(filename, obj):
+    with open('./data/' + filename + '.json', 'w') as outfile:
+        outfile.write(jsonpickle.encode(obj))
+import pickle
+# pickle: binary save and load for python.
+def save(filename, obj):
+    with open('./data/' + filename + '.dat', 'bw') as outfile:
+        pickle.dump(obj, outfile)
+def load(filename):
+    with open('./data/' + filename + '.dat', 'br') as infile:
+        return pickle.load(infile)
 
 
 

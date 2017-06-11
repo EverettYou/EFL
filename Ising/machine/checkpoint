@@ -1,2 +1,2 @@
-model_checkpoint_path: "Ising(SSLatt(32,100,UUI))FF(64,0.00,12.0)random"
-all_model_checkpoint_paths: "Ising(SSLatt(32,100,UUI))FF(64,0.00,12.0)random"
+model_checkpoint_path: "Ising(SSLatt(32,100,UUI))FF(64,0.50,4.0)weighted"
+all_model_checkpoint_paths: "Ising(SSLatt(32,100,UUI))FF(64,0.50,4.0)weighted"

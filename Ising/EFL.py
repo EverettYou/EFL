@@ -188,15 +188,18 @@ class FreeFermion(object):
         self.mass = mass # fermion mass
         self.c = c # central charge
         self.info = 'FF({0},{1:.2f},{2:.1f})'.format(self.size, self.mass, self.c)
-        self.G = self.mkG() # store single-particle density matrix
-    # construct single-particle density matrix
-    def mkG(self):
-        u = np.tile([1.+self.mass, 1.-self.mass], self.size//2) # hopping
-        A = np.roll(np.diag(u), 1, axis=1) # periodic rolling
-        A = 1.j * (A - np.transpose(A)) # Hamiltonian
-        (_, U) = np.linalg.eigh(A) # digaonalization
-        V = U[:,:self.size//2] # take lower half levels
-        return np.dot(V, V.conj().T) # construct density matrix
+        self._built = False
+    # build system
+    def build(self):
+        if not self._built:
+            self._built = True # change status
+            # construct single-particle density matrix
+            u = np.tile([1.+self.mass, 1.-self.mass], self.size//2) # hopping
+            A = np.roll(np.diag(u), 1, axis=1) # periodic rolling
+            A = 1.j * (A - np.transpose(A)) # Hamiltonian
+            (_, U) = np.linalg.eigh(A) # digaonalization
+            V = U[:,:self.size//2] # take lower half levels
+            self.G = np.dot(V, V.conj().T) # construct density matrix
     # calculate entanglement entropy given sites
     def S(self, sites):
         if len(sites) == 0: return 0.
@@ -287,133 +290,33 @@ class Chain(object):
 # Lattice (base class)
 class Lattice(object):
     def __init__(self):
+        self.width = 0
         self.depth = 0
         self.chains = []
+        self.node_dict = {}
+        self.slot_dict = {}
+        self.adj_dict = {}
+        self.size ={}
+        self._built = False
     # getitem method returns the chain
     def __getitem__(self, key):
         return self.chains[key]
     def __iter__(self):
         return iter(self.chains)
-    # print lattice structure
-    def print_structure(self, upto = 'node'):
-        print('depth = ',self.depth)
-        if not upto == 'none':
-            for chain in self:
-                print(chain)
-                if not upto == 'chain':
-                    for cell in chain:
-                        if cell in chain.UVcells:
-                            print('├', cell, 'UV')
-                        elif cell in chain.IRcells:
-                            print('├', cell, 'IR')
-                        else:
-                            print('├', cell)
-                        if not upto == 'cell': 
-                            for node in cell:
-                                print('│ ├', node)
-# Single Sheeted Lattice (subclass of Lattice) 
-class SSLattice(Lattice):
-    def __init__(self, width, depth, pattern = [-1,1]):
-        self.width = width
-        self.depth = depth
-        self.pattern = pattern
-        self.info = 'SSLatt({0},{1},'.format(width,depth)+''.join({-1:'U',1:'I'}[p] for p in pattern)+')'
-        self.chains = []
-        self.build()
-    # build lattice according to the pattern
-    # pattern = (p_1,p_2,...,p_n) with p_i = +1 for IR, -1 for UV
+    # build lattice
     def build(self):
-        pattern_len = len(self.pattern)
-        # from UV to IR
-        chain_size = self.width # intial chain size
-        for z in range(self.depth):
-            # create a chain of chain_size
-            chain = Chain(self, z, size = chain_size)
-            # specify UV/IR cells
-            if z == 0: # for the input layer all cells are IR
-                chain.IRcells = chain.cells
-            else:
-                for u in range(0, chain_size, pattern_len):
-                    for (i, p) in enumerate(self.pattern):
-                        j = u + i
-                        if j < chain_size:
-                            if p == +1: # IR, up wards
-                                chain.IRcells.append(chain[j])
-                            elif p == -1: # UV, down wards
-                                chain.UVcells.append(chain[j])
-            # register chain to collections
-            self.chains.append(chain)
-            # calculate chain size of the next layer (IR)
-            chain_size = pattern_len * (len(chain.IRcells) // self.pattern.count(-1))
-            # chain size vanish, stop going deeper
-            if chain_size == 0:
-                self.depth = len(self.chains) # overwrite depth to the current depth
-                break # break z loop
-        # final touch: remove the IR cells from the top chain
-        self[-1].removeIR()
-        # collect nodes and links
-        self.collect()
-    # collect nodes and links (as directed graph) upto specified depth
-    def collect(self, depth = None):
-        # four dictionaries will be generated
-        # node_dict = {node: ind, ...} maps Node object to its global index
-        #                              in the lattice graph
-        # slot_dict = {'wh': {lbl: ind, ...}, 
-        #              'wJ': {lbl: ind, ...}}
-        #       collects and classifies slots into wh and wJ weights
-        #       keeps the slot label to global index mapping
-        #       the slot index -> the slice index in the adjacency tensor   
-        # adj_dict = {'1': [[(i,j), ±1.] ...],
-        #             'wh': [[(s,i,j), ±1.] ...],
-        #             'wJ': [[(s,i,j), ±1.] ...]}
-        #       stores the instructions to make the adjacency tensor
-        # size = {'node': *, 'wh': *, 'wJ': *}
-        #       keeps the size information of nodes, wh and wJ
-        if depth is None: # the depth of the lattice to be collected
-            depth = self.depth
-        else: # prevent depth to go beyond bound
-            depth = min(depth, self.depth)
-        # prepare dicts
-        self.node_dict = {}
-        self.slot_dict = {}
-        self.adj_dict = {}
-        # from UV to IR
-        for chain in self[:depth]:
-            z = chain.index # keep chain index in z
-            # intra-cell links
-            lkinfo = ('1',) # constant 1
-            for cell in chain:
-                self.mk_link(cell[0], cell[1], info = lkinfo)
-            for cell in chain.UVcells:
-                self.mk_link(cell[0], cell[2], info = lkinfo)
-                self.mk_link(cell[1], cell[2], info = lkinfo)
-            for cell in chain.IRcells:
-                self.mk_link(cell[0], cell[2], info = lkinfo)
-                self.mk_link(cell[2], cell[1], info = lkinfo)
-            # inter-cell links
-            # horizontal (dual) links
-            for cell in chain:
-                x = cell.index # keep cell index in x
-                # determine the link type
-                if z == 0: # for input layer
-                    lkinfo = ('wh', x) # weight of h
-                elif z == depth - 1: # for top layer
-                    lkinfo = ('1',) # constant 1
-                else: # for the rest of the bulk layers
-                    lkinfo = ('wJ', z) # weight of J
-                if x == 0: # for the boundary link: reverse direction
-                    self.mk_link(chain[0][0], chain[-1][1], info = lkinfo)
-                else: # for the remaining links: normal direction
-                    self.mk_link(chain[x-1][1], chain[x][0], info = lkinfo)
-            # vertical (dual) links
-            if z < depth - 1: # if not the top layer
-                chainIR = chain.IR # get the IR chain
-                for (cell0, cell1) in zip(chain.IRcells, chainIR.UVcells):
-                    lkinfo = ('wJ', z + 1) # weight of J
-                    self.mk_link(cell0[2], cell1[2], info = lkinfo)
-        # set sizes
-        self.size = {typ: len(lbls) for (typ, lbls) in self.slot_dict.items()}
-        self.size['node'] = len(self.node_dict)
+        if not self._built:
+            self._built = True # change status
+            self.construct() # construct lattice structure
+            self.collect() # collect nodes and links
+    # construct lattice structure
+    def construct(self):
+        # set up chains here
+        pass
+    # collect nodes and links
+    def collect(self):
+        # set up dictionaries here
+        pass
     # make link
     def mk_link(self, node0, node1, info):
         # get node indices
@@ -479,29 +382,137 @@ class SSLattice(Lattice):
         else:
             raise ValueError('Lattice.lcvect receives unknown type "{0}".'.format(typ))
         return lc
+    # print lattice structure
+    def print_structure(self, upto = 'node'):
+        print('depth = ',self.depth)
+        if not upto == 'none':
+            for chain in self:
+                print(chain)
+                if not upto == 'chain':
+                    for cell in chain:
+                        if cell in chain.UVcells:
+                            print('├', cell, 'UV')
+                        elif cell in chain.IRcells:
+                            print('├', cell, 'IR')
+                        else:
+                            print('├', cell)
+                        if not upto == 'cell': 
+                            for node in cell:
+                                print('│ ├', node)
+# Single Sheeted Lattice (subclass of Lattice) 
+class SSLattice(Lattice):
+    def __init__(self, width, depth, pattern = [-1,1]):
+        super().__init__()
+        self.width = width
+        self.depth = depth
+        self.pattern = pattern
+        self.info = 'SSLatt({0},{1},'.format(width,depth)+''.join({-1:'U',1:'I'}[p] for p in pattern)+')'
+    # construct lattice according to the pattern
+    # pattern = (p_1,p_2,...,p_n) with p_i = +1 for IR, -1 for UV
+    def construct(self):
+        pattern_len = len(self.pattern)
+        # from UV to IR
+        chain_size = self.width # intial chain size
+        for z in range(self.depth):
+            # create a chain of chain_size
+            chain = Chain(self, z, size = chain_size)
+            # specify UV/IR cells
+            if z == 0: # for the input layer all cells are IR
+                chain.IRcells = chain.cells
+            else:
+                for u in range(0, chain_size, pattern_len):
+                    for (i, p) in enumerate(self.pattern):
+                        j = u + i
+                        if j < chain_size:
+                            if p == +1: # IR, up wards
+                                chain.IRcells.append(chain[j])
+                            elif p == -1: # UV, down wards
+                                chain.UVcells.append(chain[j])
+            # register chain to collections
+            self.chains.append(chain)
+            # calculate chain size of the next layer (IR)
+            chain_size = pattern_len * (len(chain.IRcells) // self.pattern.count(-1))
+            # chain size vanish, stop going deeper
+            if chain_size == 0:
+                self.depth = len(self.chains) # overwrite depth to the current depth
+                break # break z loop
+        # final touch: remove the IR cells from the top chain
+        self[-1].removeIR()
+    # collect nodes and links (as directed graph) upto specified depth
+    def collect(self):
+        # four dictionaries will be generated
+        # node_dict = {node: ind, ...} maps Node object to its global index
+        #                              in the lattice graph
+        # slot_dict = {'wh': {lbl: ind, ...}, 
+        #              'wJ': {lbl: ind, ...}}
+        #       collects and classifies slots into wh and wJ weights
+        #       keeps the slot label to global index mapping
+        #       the slot index -> the slice index in the adjacency tensor   
+        # adj_dict = {'1': [[(i,j), ±1.] ...],
+        #             'wh': [[(s,i,j), ±1.] ...],
+        #             'wJ': [[(s,i,j), ±1.] ...]}
+        #       stores the instructions to make the adjacency tensor
+        # size = {'node': *, 'wh': *, 'wJ': *}
+        #       keeps the size information of nodes, wh and wJ
+        for chain in self[:self.depth]: # from UV to IR
+            z = chain.index # keep chain index in z
+            # intra-cell links
+            lkinfo = ('1',) # constant 1
+            for cell in chain:
+                self.mk_link(cell[0], cell[1], info = lkinfo)
+            for cell in chain.UVcells:
+                self.mk_link(cell[0], cell[2], info = lkinfo)
+                self.mk_link(cell[1], cell[2], info = lkinfo)
+            for cell in chain.IRcells:
+                self.mk_link(cell[0], cell[2], info = lkinfo)
+                self.mk_link(cell[2], cell[1], info = lkinfo)
+            # inter-cell links
+            # horizontal (dual) links
+            for cell in chain:
+                x = cell.index # keep cell index in x
+                # determine the link type
+                if z == 0: # for input layer
+                    lkinfo = ('wh', x) # weight of h
+                elif z == self.depth - 1: # for top layer
+                    lkinfo = ('1',) # constant 1
+                else: # for the rest of the bulk layers
+                    lkinfo = ('wJ', z) # weight of J
+                if x == 0: # for the boundary link: reverse direction
+                    self.mk_link(chain[0][0], chain[-1][1], info = lkinfo)
+                else: # for the remaining links: normal direction
+                    self.mk_link(chain[x-1][1], chain[x][0], info = lkinfo)
+            # vertical (dual) links
+            if z < self.depth - 1: # if not the top layer
+                chainIR = chain.IR # get the IR chain
+                for (cell0, cell1) in zip(chain.IRcells, chainIR.UVcells):
+                    lkinfo = ('wJ', z + 1) # weight of J
+                    self.mk_link(cell0[2], cell1[2], info = lkinfo)
+        # set sizes
+        self.size = {typ: len(lbls) for (typ, lbls) in self.slot_dict.items()}
+        self.size['node'] = len(self.node_dict)
 ''' Ising Model '''
 class IsingModel(object):
     def __init__(self, lattice):
         self.lattice = lattice
         self.info = 'Ising({0})'.format(lattice.info)
-        self.partitions = lattice.size['wh']
     # build model (given input log bound dimension lnD)
     def build(self, lnD):
+        self.lattice.build() # first build lattice
         # setup adjacency tensors as TF constants
         A_bg = tf.constant(self.lattice.adjten('1'),dtype = tf.float64, name = 'A_bg')
         As_h = tf.constant(self.lattice.adjten('wh'),dtype = tf.float64, name = 'As_h')
         As_J = tf.constant(self.lattice.adjten('wJ'),dtype = tf.float64, name = 'As_J')
         # boundary Ising configurations
-        conf0 = tf.ones([self.partitions], dtype = tf.float64, name = 'conf0')
+        conf0 = tf.ones([self.lattice.size['wh']], dtype = tf.float64, name = 'conf0')
         self.confs = tf.placeholder(dtype = tf.float64, 
-                shape = [None, self.partitions], name = 'confs')
+                shape = [None, self.lattice.size['wh']], name = 'confs')
         # external field configurations
         with tf.name_scope('h'):
             self.h = lnD/2. # external field strength
             hs = self.h * self.confs
             h0 = self.h * conf0
         # coupling strength (trainable variable)
-        self.J = tf.Variable(0.5 * np.ones(self.lattice.size['wJ']), 
+        self.J = tf.Variable(0.27 * np.ones(self.lattice.size['wJ']), 
                 dtype = tf.float64, name = 'J')
         # generate weighted adjacency matrices
         with tf.name_scope('Ising_net'):
@@ -525,6 +536,13 @@ class IsingModel(object):
             # record cost function
             tf.summary.scalar('logMSE', tf.log(self.MSE))
             tf.summary.scalar('logwall', tf.log(self.wall + 1.e-10))
+        # coupling regularizer
+        with tf.name_scope('regularizer'):
+            Jrelu = tf.nn.relu(self.J) # first remove negative couplings
+            # construct the upper bond
+            Jmax = tf.concat([tf.reshape(self.h,[1]),Jrelu[:-1]],axis=0)
+            # clip by the upper bond and assign to J
+            self.regularizer = self.J.assign(tf.minimum(Jrelu, Jmax))
     # convert coupling to weight, and contract with adjacency matrix
     def wdotA(self, f, A, name = 'wdotA'):
         with tf.name_scope(name):
@@ -538,7 +556,7 @@ class IsingModel(object):
                 F0 = tf.reduce_sum(Js) + tf.reduce_sum(hs, -1)
             logdetA = logdet(A)
             F = -0.5*logdetA + F0
-        return F
+        return F                
 ''' Entanglement Feature Learning
 input:
     system : object that has a method S to return the entropy
@@ -550,15 +568,14 @@ class DataServer(object):
         self.model = model
         self.system = system
         self.size = system.size
-        self.partitions = model.partitions
+        self.partitions = model.lattice.width
         assert self.size%self.partitions == 0, 'Size not divisible by partitions.'
         self.blocksize = self.size // self.partitions
         self.lnD = self.blocksize * self.system.c * np.log(2.)
         # set up a entanglement region server
         self.region_server = RegionServer(self.partitions)
         self.method = None
-        # set up a block to site mapping
-        self.blockmap = np.arange(self.size).reshape([self.partitions, self.blocksize])
+        self.blockmap = None
     # get sites given a region
     def sites(self, region):
         # if the region is over half of the partitions
@@ -566,6 +583,9 @@ class DataServer(object):
             # take the complement region instead
             return self.sites(region.complement())
         else: # map block indices to site indices
+            if self.blockmap is None:
+                self.blockmap = np.arange(self.size).reshape(
+                            [self.partitions, self.blocksize])
             return self.blockmap[list(region)].flatten()
     # calculate entanglement feature and package data
     def pack(self, regions):
@@ -594,11 +614,12 @@ class Machine(object):
         self.system = system
         self.method = method
         self.data_server = DataServer(model, system)
-        self.graph = tf.Graph()
-        self.session = tf.Session(graph = self.graph)
-        self.build() # build machine
-        # initialization flag (should not initialize here)
-        self.initialized = False
+        self.graph = tf.Graph() # TF graph
+        self.session = tf.Session(graph = self.graph) # TF session
+        self.para = None # parameter dict
+        # status flags
+        self._built = False
+        self._initialized = False
     def __getattr__(self, attr):
         if attr == 'info':
             return self.model.info+self.system.info+''.join(str(x) for x in self.method)
@@ -606,50 +627,29 @@ class Machine(object):
             raise AttributeError
     # build machine
     def build(self):
-        with self.graph.as_default():
-            self.model.build(self.data_server.lnD)
-            self.step = tf.Variable(0,name='step',trainable=False)
-            self.learning_rate = tf.placeholder(tf.float32,shape=[],name='learning_rate')
-            self.beta1 = tf.placeholder(tf.float32,shape=[],name='beta1')
-            self.beta2 = tf.placeholder(tf.float32,shape=[],name='beta2')
-            self.epsilon = tf.placeholder(tf.float32,shape=[],name='epsilon')
-            self.optimizer = tf.train.AdamOptimizer(
-                            learning_rate=self.learning_rate, 
-                            beta1=self.beta1, 
-                            beta2=self.beta2, 
-                            epsilon=self.epsilon)
-            self.trainer = self.optimizer.minimize(self.model.cost, 
-                            global_step = self.step)
-            self.initializer = tf.global_variables_initializer()
-            self.regularizer = self.regularize() # set up regularizer
-            self.writer = self.pipe() # set up data pipeline
-            self.saver = tf.train.Saver() # add saver
-        return self
-    # train machine
-    def train(self, steps=1, check=20, method=None, batch=None, 
-            learning_rate=0.005, beta1=0.9, beta2=0.9, epsilon=1e-8):
-        if method is None:
-            method = self.method # by default, use global method
-        else:
-            self.method = method # otherwise method updated
-        # setup parameter feed dict
-        self.para = {self.learning_rate:learning_rate, 
-                    self.beta1:beta1, 
-                    self.beta2:beta2, 
-                    self.epsilon:epsilon}
-        if not self.initialized: # if not initialized yet
-            self.session.run(self.initializer, self.para) # initialize graph
-            self.initialized = True
-        for i in range(steps):
-            # construct the feed dict, attache data to para
-            self.feed = {**self.para, **self.data_server.fetch(method, batch)}
-            try: # zero determinant may cause a problem, try it
-                self.session.run(self.trainer, self.feed) # train one step
-            except tf.errors.InvalidArgumentError: # when things go wrong
-                continue # skip the rest, go the the next batch of data
-            self.session.run(self.regularizer) # run regularization
-            if self.session.run(self.step)%check == 0: # summarize
-                self.writer.add_summary(*self.session.run(self.summary, self.feed))
+        if not self._built: # if not built
+            self._built = True # change status
+            # build machine
+            self.system.build() # build system
+            # add nodes to the TF graph
+            with self.graph.as_default():
+                self.model.build(self.data_server.lnD) # build model
+                self.step = tf.Variable(0,name='step',trainable=False)
+                self.learning_rate = tf.placeholder(tf.float32,shape=[],name='lr')
+                self.beta1 = tf.placeholder(tf.float32,shape=[],name='beta1')
+                self.beta2 = tf.placeholder(tf.float32,shape=[],name='beta2')
+                self.epsilon = tf.placeholder(tf.float32,shape=[],name='epsilon')
+                self.optimizer = tf.train.AdamOptimizer(
+                                learning_rate=self.learning_rate, 
+                                beta1=self.beta1, 
+                                beta2=self.beta2, 
+                                epsilon=self.epsilon)
+                self.trainer = self.optimizer.minimize(self.model.cost, 
+                                global_step = self.step)
+                self.initializer = tf.global_variables_initializer()
+                self.regularizer = self.model.regularizer
+                self.writer = self.pipe() # set up data pipeline
+                self.saver = tf.train.Saver() # add saver
     # pipe data (by summary)
     def pipe(self):
         # get variable names
@@ -666,14 +666,38 @@ class Machine(object):
         self.summary = [tf.summary.merge_all(), self.step]
         timestamp = datetime.now().strftime('%d%H%M%S')
         return tf.summary.FileWriter('./log/' + timestamp)
-    # regularize the coupling
-    def regularize(self):
-        with tf.name_scope('regularizer'):
-            Jrelu = tf.nn.relu(self.model.J) # first remove negative couplings
-            # construct the upper bond
-            Jmax = tf.concat([tf.reshape(self.model.h,[1]),Jrelu[:-1]],axis=0)
-            # clip by the upper bond and assign to J
-            return self.model.J.assign(tf.minimum(Jrelu, Jmax))        
+    # initialize machine
+    def initialize(self):
+        if not self._initialized: # if not initialized
+            self._initialized = True # change status
+            # initialize machine
+            assert not self.para is None, 'Machine.para was not set yet.'
+            self.session.run(self.initializer, self.para) # initialize graph
+    # train machine
+    def train(self, steps=1, check=20, method=None, batch=None, 
+            learning_rate=0.005, beta1=0.9, beta2=0.9, epsilon=1e-8):
+        self.build() # if not built, build it
+        if method is None:
+            method = self.method # by default, use global method
+        else:
+            self.method = method # otherwise method updated
+        # setup parameter feed dict
+        self.para = {self.learning_rate:learning_rate, 
+                    self.beta1:beta1, 
+                    self.beta2:beta2, 
+                    self.epsilon:epsilon}
+        self.initialize() # if not initialized, initialize it
+        # start training loop
+        for i in range(steps):
+            # construct the feed dict, attach data to para
+            self.feed = {**self.para, **self.data_server.fetch(method, batch)}
+            try: # zero determinant may cause a problem, try it
+                self.session.run(self.trainer, self.feed) # train one step
+            except tf.errors.InvalidArgumentError: # when things go wrong
+                continue # skip the rest, go the the next batch of data
+            self.session.run(self.regularizer) # run regularization
+            if self.session.run(self.step)%check == 0: # summarize
+                self.writer.add_summary(*self.session.run(self.summary, self.feed))
     # graph export for visualization in TensorBoard 
     def add_graph(self):
         self.writer.add_graph(self.graph) # writter add graph
@@ -685,10 +709,11 @@ class Machine(object):
         print('INFO:tensorflow:Saving parameters to %s'%path)
     # load session
     def load(self):
+        self.build() # if not built, build it
         # restore model
         self.saver.restore(self.session, './machine/'+self.info)
         # session is initialized after loading 
-        self.initialized = True      
+        self._initialized = True      
 # Toolbox 
 # I/O 
 # JSON pickle: export to communicate with Mathematica 

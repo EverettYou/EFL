@@ -1,0 +1,2 @@
+model_checkpoint_path: "Ising(SSLatt(32,6,UI))FF(64,0.00,4.0)multiple"
+all_model_checkpoint_paths: "Ising(SSLatt(32,6,UI))FF(64,0.00,4.0)multiple"

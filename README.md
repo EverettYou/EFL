@@ -4,4 +4,4 @@ This project provides an implementation of entanglement feature learning based o
 
 ## Requirements
 * Numpy
-* Theano
+* TensorFlow
